@@ -48,7 +48,7 @@ test('B joins a live session: history comes from the host store, not from the Ag
   assert.equal(b.updates(sessionId).at(-1).messageId, 'm2', 'after joining, B gets live updates too');
 });
 
-test('permission request has answer "any": both Clients see it, the first answer wins, the other is withdrawn', async () => {
+test('permission request has binding "resource": both Clients see it, the first answer wins, the other is withdrawn', async () => {
   const { agent, a, b, sessionId } = await twoClients();
 
   const reply = agent.ask('session/request_permission', { sessionId, toolCall: { toolCallId: 't1' }, options: [{ optionId: 'allow', kind: 'allow_once', name: 'Allow' }] });
@@ -111,7 +111,7 @@ test('closing a session that another Client still uses does not close it in the 
   assert.equal(a.updates(sessionId).length, 0);
 });
 
-test('a session request without answer "any" goes to one Client: the one that sent the latest prompt', async () => {
+test('a session request with binding "connection" goes to one Client: the one that sent the latest prompt', async () => {
   const PICK = { methods: { '_fixture/pick': { 'x-audience': { resource: ['/sessions/{sessionId}'] } } } };
   const { agent, a, b, sessionId } = await twoClients({ agentSchema: PICK });
   void b.peer.request('session/prompt', { sessionId, prompt: [text('go')] });
@@ -124,7 +124,7 @@ test('a session request without answer "any" goes to one Client: the one that se
   assert.equal(a.got('_fixture/pick').length, 0);
 });
 
-test('an answer "any" request ends when every Client that holds it answered with an error, or left', async () => {
+test('a request bound to the resource ends when every Client that holds it answered with an error, or left', async () => {
   const { agent, a, b, sessionId } = await twoClients();
   const reply = agent.ask('session/request_permission', { sessionId, toolCall: { toolCallId: 't1' }, options: [] });
   await tick();
@@ -145,4 +145,13 @@ test("a Client's $/cancel_request reaches the Agent with the Agent's ID of that 
   await tick();
   const upstreamId = agent.calls.find(m => m.method === 'session/prompt')!.id;
   assert.deepEqual(agent.calls.find(m => m.method === '$/cancel_request')?.params, { requestId: upstreamId });
+});
+
+test('a permission request upserts the tool call it carries, and a joining Client gets that tool call', async () => {
+  const { agent, client, sessionId } = await sharedSession();
+  void agent.ask('session/request_permission', { sessionId, subject: { type: 'tool_call', toolCall: { toolCallId: 't7', title: 'rm -rf build' } }, options: [] });
+  await tick();
+  const b = await client();
+  await b.call('session/resume', { sessionId, cwd: '/w', mcpServers: [], replayFrom: { type: 'start' } });
+  assert.deepEqual(b.updates(sessionId).find(u => u.sessionUpdate === 'tool_call_update'), { sessionUpdate: 'tool_call_update', toolCallId: 't7', title: 'rm -rf build' });
 });

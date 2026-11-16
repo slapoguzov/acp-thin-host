@@ -16,9 +16,10 @@ The host has code only for the session lifecycle: `initialize`, `session/new|for
 | Need | Without the schema data | With it |
 |---|---|---|
 | A Client joins a live session | Ask the Agent to replay, and the replay also goes to the Clients that already have it. Or keep raw updates, which breaks the replay rules (old `state_update`, old notices) | `session/resume` is answered from the host's store (`x-state`): history, `replay_complete`, current values, `state_update` last. The Agent is not asked |
-| A permission request | Shown to one Client by a guess, or to everyone with no rule for the answer | `answer: "any"`: shown to every Client of the session. The first answer wins, the others get `$/cancel_request` |
+| A permission request | Shown to one Client by a guess, or to everyone with no rule for the answer | `binding: "resource"`: shown to every Client of the session. The first answer wins, the others get `$/cancel_request` |
 | A request about one Client's request (`elicitation/create` with `requestId`) | Goes to the Client of the session, which may be the wrong one | `/requests/{requestId}`: only the Client that sent that request, with its own request ID |
 | `_auth/status_update`, which has no `sessionId` | Dropped: a host that routes by `sessionId` has nowhere to send it | `/`: every Client |
+| A permission request carries a tool call | Code that copies it into the tool call | A row on the request: the tool call is stored, and a joining Client gets it |
 | A new or custom update or method | Code for each one | A schema row, or the Agent's `capabilities.schema` in `initialize` |
 
 ## Files
@@ -26,9 +27,9 @@ The host has code only for the session lifecycle: `initialize`, `session/new|for
 | File | Lines | What it does |
 |---|---|---|
 | [`src/paths.ts`](src/paths.ts) | 37 | The path grammar shared by both keywords |
-| [`src/state.ts`](src/state.ts) | 160 | `x-state`: one generic fold of session state, and the replay a joining Client gets |
-| [`src/audience.ts`](src/audience.ts) | 48 | `x-audience`: the resource of an Agent-to-Client message |
-| [`src/host.ts`](src/host.ts) | 261 | The host: connections, the session lifecycle, delivery by resource |
+| [`src/state.ts`](src/state.ts) | 200 | `x-state`: one generic fold of session state, and the replay a joining Client gets |
+| [`src/audience.ts`](src/audience.ts) | 55 | `x-audience`: the resource of an Agent-to-Client message |
+| [`src/host.ts`](src/host.ts) | 262 | The host: connections, the session lifecycle, delivery by resource |
 | [`src/jsonrpc.ts`](src/jsonrpc.ts) | 54 | Newline-delimited JSON-RPC over a child process or a socket, with `--trace` |
 | [`src/main.ts`](src/main.ts) | 51 | `serve` (Agent, socket, `--trace`) and `connect` (stdio to socket, for Air) |
 | [`src/watch.ts`](src/watch.ts) | 63 | A small terminal Client for the demo |
@@ -46,7 +47,7 @@ git clone --recurse-submodules git@github.com:slapoguzov/acp-thin-host.git
 ```
 
 ```sh
-npm test                                                     # 16 tests on a scripted Agent; the first run downloads the ACP schema
+npm test                                                     # 24 tests on a scripted Agent; the first run downloads the ACP schema
 node src/main.ts serve --socket /tmp/acp-thin-host.sock \
   --agent-schema agent-schema/claude-codex.json -- npx -y @agentclientprotocol/claude-agent-acp
 node src/watch.ts --socket /tmp/acp-thin-host.sock           # in another terminal

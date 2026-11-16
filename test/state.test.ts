@@ -16,7 +16,9 @@ function fold(updates: any[], store = new SessionStore(rows)) {
 
 test('every update variant of the schema has a row', () => {
   assert.equal(Object.keys(rows.updates).length, 25);
-  assert.deepEqual(Object.keys(rows.responses).sort(), ['session/fork', 'session/new', 'session/resume', 'session/set_config_option', 'session/set_title']);
+  assert.deepEqual(Object.keys(rows.responses).sort(), ['session/delete', 'session/fork', 'session/new', 'session/resume', 'session/set_config_option', 'session/set_title']);
+  assert.deepEqual(Object.keys(rows.requests), ['session/request_permission']);
+  assert.equal(rows.updates.terminal_output_chunk[0].encoding, 'base64', 'the generator copied contentEncoding');
 });
 
 test('chunks append to their message; messages keep the order of first report', () => {
@@ -34,7 +36,7 @@ test('chunks append to their message; messages keep the order of first report', 
   ]);
 });
 
-test('terminal output is base64: chunks are decoded and the bytes appended (schema contentEncoding)', () => {
+test('terminal output is base64: the row has encoding, so chunks are decoded and the bytes appended', () => {
   const store = fold([
     { sessionUpdate: 'terminal_update', terminalId: 'x', command: 'echo' },
     { sessionUpdate: 'terminal_output_chunk', terminalId: 'x', data: Buffer.from('h').toString('base64') },
@@ -89,4 +91,37 @@ test('raw nodes keep their own numbering when another node is removed', () => {
   const store = fold([custom(1), { sessionUpdate: 'plan_update', plan: { planId: 'p1', entries: [] } }, custom(2),
     { sessionUpdate: 'plan_removed', planId: 'p1' }, custom(3)]);
   assert.deepEqual(store.replay('s1').history, [custom(1), custom(2), custom(3)]);
+});
+
+test('set_title replaces info/title, a field inside the current value info', () => {
+  const store = fold([{ sessionUpdate: 'session_info_update', title: 'Old', updatedAt: 'T1' }]);
+  store.applyResponse('session/set_title', { sessionId: 's1', title: 'New' }, { title: 'New' });
+  assert.deepEqual(store.current('s1', 'info'), { title: 'New', updatedAt: 'T1' });
+});
+
+test('the session/delete response removes the session and everything under it', () => {
+  const store = fold([{ sessionUpdate: 'agent_message_chunk', messageId: 'a1', content: text('x') }, { sessionUpdate: 'state_update', state: 'idle' }]);
+  store.applyResponse('session/delete', { sessionId: 's1' }, {});
+  assert.deepEqual(store.replay('s1'), { history: [], current: [] });
+});
+
+test('a permission request upserts its tool call; one without a tool call changes nothing', () => {
+  const store = fold([{ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'in_progress' }]);
+  store.applyRequest('session/request_permission', { sessionId: 's1', subject: { type: 'tool_call', toolCall: { toolCallId: 't1', title: 'Edit' } } });
+  store.applyRequest('session/request_permission', { sessionId: 's1', subject: { type: 'command', command: 'ls' } });
+  assert.deepEqual(store.replay('s1').history, [{ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'in_progress', title: 'Edit' }]);
+});
+
+test('a row whose path field is absent is not applied', () => {
+  const store = fold([{ sessionUpdate: 'tool_call_update', status: 'completed' }]); // no toolCallId
+  assert.deepEqual(store.replay('s1'), { history: [], current: [] });
+});
+
+test('a custom row that writes an ACP node is ignored', () => {
+  const custom = withAgentRows(rows, { sessionUpdates: {
+    _fixture_title: { 'x-state': { action: 'replace', path: '/sessions/{sessionId}/info', value: 'update.info' } },
+    _fixture_task: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/_tasks/{update.taskId}' } },
+  } });
+  assert.equal(custom.updates._fixture_title, undefined);
+  assert.ok(custom.updates._fixture_task);
 });

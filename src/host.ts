@@ -10,13 +10,13 @@
 import { Peer, type Message } from './jsonrpc.ts';
 import { SessionStore, withAgentRows, type StateRows } from './state.ts';
 import { rowsFromSchema } from '../schema/rows.ts';
-import { anyMayAnswer, audienceFromSchema, resourceOf, withCustomMethods, type AudienceTable, type Resource } from './audience.ts';
+import { bindsToResource, audienceFromSchema, resourceOf, withCustomMethods, type AudienceTable, type Resource } from './audience.ts';
 import { lookup } from './paths.ts';
 
 type Connection = { id: number; peer: Peer };
 
 /** An Agent-to-Client request while it waits for an answer. */
-type Pending = { agentId: number | string; method: string; params: any; anyMayAnswer: boolean; shownTo: Map<Connection, number>; errors: Map<Connection, Message>; done: boolean };
+type Pending = { agentId: number | string; method: string; params: any; toResource: boolean; shownTo: Map<Connection, number>; errors: Map<Connection, Message>; done: boolean };
 
 export type HostOptions = { schema: any; agentSchema?: any; log?: (line: string) => void };
 
@@ -157,6 +157,7 @@ export class ThinHost {
   private fromAgent(message: Message) {
     if (message.method === '$/cancel_request') return this.withdraw(this.pending.get(message.params?.requestId));
     if (message.method === 'session/update') this.store.applyUpdate(message.params);
+    else if (message.id !== undefined) this.store.applyRequest(message.method!, message.params); // a permission request carries its tool call
 
     const resource = resourceOf(this.audience, message.method!, message.params);
     const holders = resource ? this.connectionsHolding(resource) : [];
@@ -170,12 +171,12 @@ export class ThinHost {
       this.log(`refused ${message.method}: no audience`);
       return this.agent.send({ id: message.id, error: { code: -32601, message: `${message.method} has no audience` } });
     }
-    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, anyMayAnswer: anyMayAnswer(this.audience, message.method!), shownTo: new Map(), errors: new Map(), done: false };
+    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, toResource: bindsToResource(this.audience, message.method!), shownTo: new Map(), errors: new Map(), done: false };
     this.pending.set(message.id, request);
-    // answer "any": show it to every holder, the first answer wins. Otherwise one connection:
+    // binding "resource": show it to every holder, the first answer wins. binding "connection": one connection,
     // the one that sent the session's latest prompt, else the first holder.
     const prompter = resource.kind === 'sessions' ? this.prompter.get((resource as any).id) : undefined;
-    const to = request.anyMayAnswer ? holders : [holders.find(c => c === prompter) ?? holders[0]].filter(Boolean);
+    const to = request.toResource ? holders : [holders.find(c => c === prompter) ?? holders[0]].filter(Boolean);
     if (!to.length) return this.finish(request, { error: { code: -32603, message: 'no connection holds the resource' } });
     for (const connection of to) this.show(request, connection, resource);
   }
@@ -192,7 +193,7 @@ export class ThinHost {
   private answer(connection: Connection, message: Message) {
     const request = [...this.pending.values()].find(p => p.shownTo.get(connection) === message.id);
     if (!request || request.done) return; // late answer of a request that another connection answered
-    if (message.error && request.anyMayAnswer) {
+    if (message.error && request.toResource) {
       request.errors.set(connection, message);
       if (request.errors.size < request.shownTo.size) return; // others may still answer
     }
@@ -213,11 +214,11 @@ export class ThinHost {
     for (const [connection, id] of request.shownTo) connection.peer.send({ method: '$/cancel_request', params: { requestId: id } });
   }
 
-  /** A connection that joins a session also gets its pending requests that any connection may answer. */
+  /** A connection that joins a session also gets its pending requests that are bound to the session, not a connection. */
   private showPendingTo(connection: Connection, sessionId: string) {
     for (const request of this.pending.values()) {
       const resource = resourceOf(this.audience, request.method, request.params);
-      if (request.anyMayAnswer && resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
+      if (request.toResource && resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
     }
   }
 

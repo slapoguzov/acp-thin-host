@@ -19,32 +19,37 @@ const copy = <T>(value: T): T => (value === undefined ? value : structuredClone(
 export function withAgentRows(rows: StateRows, agentSchema: any): StateRows {
   const updates = { ...rows.updates };
   for (const [kind, declaration] of Object.entries<any>(agentSchema?.sessionUpdates ?? {})) {
-    if (!(kind in rows.updates) && declaration?.['x-state']) updates[kind] = [].concat(declaration['x-state']);
+    const declared: Row[] = [].concat(declaration?.['x-state'] ?? []);
+    // A custom row writes only a custom node: /sessions/{sessionId}/_name... Receivers ignore any other row.
+    const custom = declared.length > 0 && declared.every(row => row.action === 'none' || /^\/sessions\/\{[\w.]+\}\/_/.test(row.path ?? ''));
+    if (!(kind in rows.updates) && custom) updates[kind] = declared;
   }
   return { ...rows, updates };
 }
 
 /**
- * Splits a resolved row path into the entity and the field inside it.
- * The entity is the path up to and including its last ID segment after the session ID;
- * "/sessions/s1/terminals/t1/output/data" -> entity "/sessions/s1/terminals/t1", field ["output", "data"].
- * A path without such an ID segment ("/sessions/s1/config") is a current value; it is its own entity.
+ * Splits a resolved row path into the node and the field inside it.
+ * - An entity is the path up to and including its last ID segment after the session ID:
+ *   "/sessions/s1/terminals/t1/output/data" is entity "/sessions/s1/terminals/t1" and field ["output", "data"].
+ * - A current value is the name after the session: "/sessions/s1/info/title" is node "/sessions/s1/info", field ["title"].
+ * - "/sessions/s1" alone is the whole session (the session/delete response removes it).
  */
 function split(rowPath: string, resolved: string) {
-  // The session segment is written {sessionId} or {result.sessionId}; one spelling lets a response row and an update
-  // row name the same node, so `render` finds the update that sends it.
-  const template = rowPath.replace(/^\/sessions\/\{[\w.]+\}/, '/sessions/{sessionId}');
-  const segments = parsePath(template);
+  // Rows of different messages name one node with different fields: {sessionId} or {result.sessionId}, {update.toolCallId}
+  // or {subject.toolCall.toolCallId}. The template keeps only the shape, {} for each field, so `render` finds the update
+  // that sends a node whichever row made it.
+  const segments = parsePath(rowPath), parts = resolved.split('/').slice(1);
+  const template = '/' + segments.map(segment => ('name' in segment ? segment.name : '{}')).join('/');
+  const sessionId = decodeURIComponent(parts[1]);
   const idAt = segments.findLastIndex((segment, index) => index >= 2 && 'field' in segment);
-  const parts = resolved.split('/').slice(1);
-  if (idAt < 0) return { entity: resolved, template, field: [] as string[], history: false, sessionId: decodeURIComponent(parts[1]) };
-  const cut = idAt + 1;
+  const cut = segments.length === 2 ? 2 : idAt < 0 ? 3 : idAt + 1; // segments that name the node
   return {
-    entity: '/' + parts.slice(0, cut).join('/'),
+    node: '/' + parts.slice(0, cut).join('/'),
     template: template.split('/').slice(0, cut + 1).join('/'),
     field: parts.slice(cut),
-    history: true,
-    sessionId: decodeURIComponent(parts[1]),
+    history: idAt >= 0,
+    wholeSession: segments.length === 2,
+    sessionId,
   };
 }
 
@@ -72,7 +77,7 @@ export class SessionStore {
       return;
     }
     const { sessionUpdate, ...payload } = params.update;
-    for (const row of rows) this.apply(row, params, payload, this.rows.encodings[`${kind} ${row.value}`]);
+    for (const row of rows) this.apply(row, params, payload);
   }
 
   /** Applies a response that has rows, at the position where it arrives. */
@@ -80,24 +85,42 @@ export class SessionStore {
     for (const row of this.rows.responses[method] ?? []) this.apply(row, { ...requestParams, result }, result);
   }
 
-  private apply(row: Row, message: any, payload: any, encoding?: string) {
-    if (row.action === 'none') return; // live only
-    const at = split(row.path!, resolvePath(row.path!, message));
+  /** Applies an Agent-to-Client request that has rows, such as the tool call that a permission request carries. */
+  applyRequest(method: string, params: any) {
+    for (const row of this.rows.requests[method] ?? []) this.apply(row, params, params);
+  }
+
+  private apply(row: Row, message: any, payload: any) {
+    if (row.action === 'none') return; // adds nothing to the state that a resume restores
+    let resolved: string;
+    try { resolved = resolvePath(row.path!, message); } catch { return; } // a field of the path is absent: not applied
+    const at = split(row.path!, resolved);
+
+    if (at.wholeSession) {
+      if (row.action === 'remove') { this.sessions.delete(at.sessionId); this.raws.delete(at.sessionId); }
+      return;
+    }
     const nodes = this.nodes(at.sessionId);
-    if (row.action === 'remove') { nodes.delete(at.entity); return; }
+    if (row.action === 'remove') { // the node and everything under it
+      if (at.field.length) { const parent = getIn(nodes.get(at.node)?.value, at.field.slice(0, -1)); if (parent) delete parent[at.field.at(-1)!]; }
+      else for (const key of [...nodes.keys()]) if (key === at.node || key.startsWith(at.node + '/')) nodes.delete(key);
+      return;
+    }
 
-    const node = nodes.get(at.entity) ?? { history: at.history, template: at.template, value: {} };
-    nodes.set(at.entity, node);
-    const source = row.value ? lookup(message, row.value) : payload;
+    let source = row.value ? lookup(message, row.value) : payload;
+    if (row.action === 'replace' && row.value) source ??= []; // an absent or null list is []
+    else if (source === undefined || source === null) return; // the value is absent: not applied
 
-    if (row.action === 'replace') node.value = copy(source ?? (row.value ? [] : {}));
-    if (row.action === 'upsert') node.value = upsert(node.value, source);
+    const node = nodes.get(at.node) ?? { history: at.history, template: at.template, value: {} };
+    nodes.set(at.node, node);
+    if (row.action === 'replace') node.value = setIn(node.value, at.field, copy(source));
+    if (row.action === 'upsert') node.value = setIn(node.value, at.field, upsert(getIn(node.value, at.field), source));
     if (row.action === 'append') {
-      const parent = at.field.slice(0, -1).reduce((object, key) => (object[key] ??= {}), node.value);
-      const key = at.field.at(-1)!, previous = parent[key];
-      if (encoding === 'base64') parent[key] = Buffer.concat([Buffer.from(previous ?? '', 'base64'), Buffer.from(String(source), 'base64')]).toString('base64');
-      else if (typeof source === 'string') parent[key] = (previous ?? '') + source;
-      else parent[key] = [...(previous ?? []), copy(source)];
+      const previous = getIn(node.value, at.field);
+      const next = row.encoding === 'base64' ? Buffer.concat([Buffer.from(previous ?? '', 'base64'), Buffer.from(String(source), 'base64')]).toString('base64')
+        : typeof source === 'string' ? (previous ?? '') + source
+        : [...(previous ?? []), copy(source)];
+      node.value = setIn(node.value, at.field, next);
     }
   }
 
@@ -137,13 +160,30 @@ export class SessionStore {
   }
 }
 
+/** The value at `field` inside `object`; `[]` is the object itself. */
+function getIn(object: any, field: string[]): any {
+  return field.reduce((at, key) => (at == null ? undefined : at[key]), object);
+}
+
+/** `object` with `value` at `field`; an empty field replaces the whole object. */
+function setIn(object: any, field: string[], value: any): any {
+  if (!field.length) return value;
+  const root = object && typeof object === 'object' && !Array.isArray(object) ? object : {};
+  const parent = field.slice(0, -1).reduce((at, key) => (at[key] = at[key] && typeof at[key] === 'object' ? at[key] : {}), root);
+  parent[field.at(-1)!] = value;
+  return root;
+}
+
 function setField(object: any, field: string, value: unknown) {
   const keys = field.split('.');
   const parent = keys.slice(0, -1).reduce((at, key) => (at[key] ??= {}), object);
   parent[keys.at(-1)!] = value;
 }
 
-/** Upsert: an omitted field is unchanged, null clears it, a value replaces it; `_meta` is patched by key. */
+/**
+ * Upsert: an omitted field is unchanged, a value replaces it, null clears it (a reader takes the default that the page of
+ * the variant defines, such as pending for the status of a tool call); `_meta` is patched by key.
+ */
 function upsert(current: any, patch: any) {
   const next = { ...current };
   for (const [key, value] of Object.entries<any>(patch ?? {})) {
