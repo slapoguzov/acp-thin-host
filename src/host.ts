@@ -2,15 +2,17 @@
 // Rules are those of the internal document "Thin ACP host: behavior".
 //
 // The host has code for the session lifecycle only (initialize, session/new|fork|resume|close, session/prompt).
-// Everything about update variants and Agent-to-Client methods comes from schema data:
+// Everything about update variants and Agent-to-Client methods comes from one table of schema data, in the shape of
+// initialize `capabilities.schema`. The host asks the Agent for its table in initialize and, for each message, uses
+// the Agent's entry, else its own, built from the schema it was started with ("Where the rows come from"):
 //   - x-state  -> `SessionStore` keeps each session's state and answers a joining Client's session/resume;
 //   - x-audience -> `resourceOf` says which connections hold a message, and who may answer a request.
-// New ACP variants and methods, and custom ones that the Agent declares in initialize, need no host code.
+// New ACP variants and methods, also ones newer than the host's schema, and custom ones need no host code.
 
 import { Peer, type Message } from './jsonrpc.ts';
-import { SessionStore, withAgentRows, type StateRows } from './state.ts';
-import { rowsFromSchema } from '../schema/rows.ts';
-import { bindsToResource, audienceFromSchema, resourceOf, withCustomMethods, type AudienceTable, type Resource } from './audience.ts';
+import { SessionStore, agentEntries } from './state.ts';
+import { tableFromSchema, withEntries, type SchemaTable } from '../schema/rows.ts';
+import { bindsToResource, resourceOf, type Resource } from './audience.ts';
 import { lookup } from './paths.ts';
 
 type Connection = { id: number; peer: Peer };
@@ -23,14 +25,15 @@ export type HostOptions = { schema: any; agentSchema?: any; log?: (line: string)
 export class ThinHost {
   private agent: Peer;
   private log: (line: string) => void;
-  private schemaRows: StateRows;
-  private schemaAudience: AudienceTable;
-  private audience!: AudienceTable;
+  /** The host's own entries: its schema, plus a configured `capabilities.schema` for Agents that send none yet. */
+  private bundled: SchemaTable;
+  /** The entries in use: the Agent's over the host's own. Clients that ask get this table. */
+  table: SchemaTable;
   private initialize?: Promise<Message>;
   private nextConnection = 1;
   private nextDownstreamId = 1;
 
-  store!: SessionStore;
+  store: SessionStore;
   /** sessionId -> connections where the session is active. */
   active = new Map<string, Set<Connection>>();
   /** sessionId -> the connection that sent its latest prompt. In v2 the prompt response only accepts the turn. */
@@ -42,28 +45,24 @@ export class ThinHost {
   private pending = new Map<number | string, Pending>();
   private connections = new Set<Connection>();
 
-  private options: HostOptions;
-
   constructor(agent: Peer, options: HostOptions) {
     this.agent = agent;
-    this.options = options;
     this.log = options.log ?? (() => {});
-    this.schemaRows = rowsFromSchema(options.schema);
-    this.schemaAudience = audienceFromSchema(options.schema);
-    this.useAgentSchema(undefined);
+    this.bundled = withEntries(tableFromSchema(options.schema), agentEntries(options.agentSchema));
+    this.table = this.bundled;
+    this.store = new SessionStore(this.table);
     agent.onMessage = message => this.fromAgent(message);
   }
 
-  /** Custom rows and methods: the Agent's `capabilities.schema`, plus a host-configured one for Agents that send none yet. */
+  /** For each message, the Agent's entry from its `capabilities.schema`, else the host's own. */
   private useAgentSchema(fromAgent: any) {
-    const merged = {
-      sessionUpdates: { ...this.options.agentSchema?.sessionUpdates, ...fromAgent?.sessionUpdates },
-      methods: { ...this.options.agentSchema?.methods, ...fromAgent?.methods },
-    };
-    const sessions = this.store?.sessions;
-    this.store = new SessionStore(withAgentRows(this.schemaRows, merged));
-    if (sessions) this.store.sessions = sessions;
-    this.audience = withCustomMethods(this.schemaAudience, merged);
+    this.table = this.store.table = withEntries(this.bundled, agentEntries(fromAgent));
+  }
+
+  /** The initialize result for one Client: the table in use when the Client set `capabilities.schema`, else no table. */
+  private initializeResult(params: any, result: any) {
+    const { schema, ...capabilities } = result.capabilities ?? {};
+    return { ...result, capabilities: params?.capabilities?.schema ? { ...capabilities, schema: this.table } : capabilities };
   }
 
   connect(peer: Peer): Connection {
@@ -97,13 +96,15 @@ export class ThinHost {
   private async clientRequest(connection: Connection, method: string, params: any, clientId: number | string): Promise<Message> {
     const sessionId: string | undefined = params?.sessionId;
 
-    if (method === 'initialize') { // one v2 initialize upstream; every Client gets its result
-      this.initialize ??= this.agent.request(method, { ...params, protocolVersion: 2 }).then(reply => {
+    if (method === 'initialize') { // one v2 initialize upstream that asks for the Agent's rows; every Client gets its result
+      const upstream = { ...params, protocolVersion: 2, capabilities: { ...params?.capabilities, schema: {} } };
+      this.initialize ??= this.agent.request(method, upstream).then(reply => {
         if (reply.error) this.initialize = undefined; // let the next Client try again
         else this.useAgentSchema(reply.result?.capabilities?.schema);
         return reply;
       });
-      return this.initialize;
+      const reply = await this.initialize;
+      return reply.error ? reply : { result: this.initializeResult(params, reply.result) };
     }
     if (method === 'session/resume' && sessionId && this.holders(sessionId).size > 0) {
       return this.join(connection, sessionId, params); // the session is live on another connection: answer from the store
@@ -159,7 +160,7 @@ export class ThinHost {
     if (message.method === 'session/update') this.store.applyUpdate(message.params);
     else if (message.id !== undefined) this.store.applyRequest(message.method!, message.params); // a permission request carries its tool call
 
-    const resource = resourceOf(this.audience, message.method!, message.params);
+    const resource = resourceOf(this.table, message.method!, message.params);
     const holders = resource ? this.connectionsHolding(resource) : [];
 
     if (message.id === undefined) { // notification: every connection that holds the resource
@@ -171,7 +172,7 @@ export class ThinHost {
       this.log(`refused ${message.method}: no audience`);
       return this.agent.send({ id: message.id, error: { code: -32601, message: `${message.method} has no audience` } });
     }
-    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, toResource: bindsToResource(this.audience, message.method!), shownTo: new Map(), errors: new Map(), done: false };
+    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, toResource: bindsToResource(this.table, message.method!), shownTo: new Map(), errors: new Map(), done: false };
     this.pending.set(message.id, request);
     // binding "resource": show it to every holder, the first answer wins. binding "connection": one connection,
     // the one that sent the session's latest prompt, else the first holder.
@@ -217,7 +218,7 @@ export class ThinHost {
   /** A connection that joins a session also gets its pending requests that are bound to the session, not a connection. */
   private showPendingTo(connection: Connection, sessionId: string) {
     for (const request of this.pending.values()) {
-      const resource = resourceOf(this.audience, request.method, request.params);
+      const resource = resourceOf(this.table, request.method, request.params);
       if (request.toResource && resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
     }
   }

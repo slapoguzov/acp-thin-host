@@ -1,30 +1,33 @@
 // Session state from x-state rows (RFD "Session state rules").
 //
-// This file knows no update variant and no method by name. Every rule comes from rows:
-//   - schema rows on each SessionUpdate variant and on five responses (`rowsFromSchema` in schema/rows.ts);
-//   - custom rows that the Agent declares in initialize `capabilities.schema.sessionUpdates`.
+// This file knows no update variant and no method by name. Every rule comes from one table in the shape of
+// initialize `capabilities.schema` (schema/rows.ts): the host's own rows with the Agent's rows over them.
 // A variant without a row is kept raw, in order, as history (host rule, "Thin ACP host: behavior").
 
 import { lookup, parsePath, resolvePath } from './paths.ts';
-import type { Row, StateRows } from '../schema/rows.ts';
+import { rowsOf, type Entry, type Row, type SchemaTable } from '../schema/rows.ts';
 
-export type { Row, StateRows };
+export type { Row, SchemaTable };
 
 /** One stored node. `template` is the entity part of the row path, so the node can be sent again as an update. */
 type Node = { history: boolean; template: string | null; value: any };
 
 const copy = <T>(value: T): T => (value === undefined ? value : structuredClone(value));
 
-/** Adds the Agent's custom rows from initialize. A row for an ACP-defined variant is ignored (RFD rule). */
-export function withAgentRows(rows: StateRows, agentSchema: any): StateRows {
-  const updates = { ...rows.updates };
-  for (const [kind, declaration] of Object.entries<any>(agentSchema?.sessionUpdates ?? {})) {
-    const declared: Row[] = [].concat(declaration?.['x-state'] ?? []);
-    // A custom row writes only a custom node: /sessions/{sessionId}/_name... Receivers ignore any other row.
-    const custom = declared.length > 0 && declared.every(row => row.action === 'none' || /^\/sessions\/\{[\w.]+\}\/_/.test(row.path ?? ''));
-    if (!(kind in rows.updates) && custom) updates[kind] = declared;
-  }
-  return { ...rows, updates };
+/**
+ * What a receiver reads in the Agent's `capabilities.schema`: x-state and x-audience, nothing else. A custom message
+ * (its name starts with _) writes only a custom node, /sessions/{sessionId}/_name...; its other rows are ignored (RFD rule).
+ */
+export function agentEntries(agentSchema: any): SchemaTable {
+  const customNode = (row: Row) => row.action === 'none' || /^\/sessions\/\{[\w.]+\}\/_/.test(row.path ?? '');
+  const read = (entries: Record<string, any> = {}) => Object.fromEntries(Object.entries(entries).flatMap(([name, entry]) => {
+    const out: Entry = {};
+    const rows = rowsOf(entry)?.filter(row => !name.startsWith('_') || customNode(row));
+    if (rows?.length) out['x-state'] = rows;
+    if (Array.isArray(entry?.['x-audience']?.resource)) out['x-audience'] = entry['x-audience'];
+    return Object.keys(out).length ? [[name, out]] : [];
+  }));
+  return { sessionUpdates: read(agentSchema?.sessionUpdates), methods: read(agentSchema?.methods) };
 }
 
 /**
@@ -54,13 +57,13 @@ function split(rowPath: string, resolved: string) {
 }
 
 export class SessionStore {
-  rows: StateRows;
+  table: SchemaTable;
   /** sessionId -> entity path -> node. A Map keeps the order of first report, across all kinds. */
   sessions = new Map<string, Map<string, Node>>();
   /** Raw nodes per session, for their keys. Not the node count: a `remove` makes that shrink. */
   private raws = new Map<string, number>();
 
-  constructor(rows: StateRows) { this.rows = rows; }
+  constructor(table: SchemaTable) { this.table = table; }
 
   nodes(sessionId: string): Map<string, Node> {
     if (!this.sessions.has(sessionId)) this.sessions.set(sessionId, new Map());
@@ -69,7 +72,7 @@ export class SessionStore {
 
   /** Applies one `session/update` notification. */
   applyUpdate(params: { sessionId: string; update: any }) {
-    const kind = params.update?.sessionUpdate, rows = this.rows.updates[kind];
+    const kind = params.update?.sessionUpdate, rows = rowsOf(this.table.sessionUpdates[kind]);
     if (!rows) { // no row: keep it raw, as history
       const count = this.raws.get(params.sessionId) ?? 0;
       this.raws.set(params.sessionId, count + 1);
@@ -82,12 +85,12 @@ export class SessionStore {
 
   /** Applies a response that has rows, at the position where it arrives. */
   applyResponse(method: string, requestParams: any, result: any) {
-    for (const row of this.rows.responses[method] ?? []) this.apply(row, { ...requestParams, result }, result);
+    for (const row of rowsOf(this.table.methods[method]) ?? []) this.apply(row, { ...requestParams, result }, result);
   }
 
   /** Applies an Agent-to-Client request that has rows, such as the tool call that a permission request carries. */
   applyRequest(method: string, params: any) {
-    for (const row of this.rows.requests[method] ?? []) this.apply(row, params, params);
+    for (const row of rowsOf(this.table.methods[method]) ?? []) this.apply(row, params, params);
   }
 
   private apply(row: Row, message: any, payload: any) {
@@ -101,15 +104,16 @@ export class SessionStore {
       return;
     }
     const nodes = this.nodes(at.sessionId);
-    if (row.action === 'remove') { // the node and everything under it
+    const source = row.value ? lookup(message, row.value) : payload;
+    // remove deletes the node and everything under it. replace with an absent or null value empties the node: an empty
+    // list or a title with no value. Without a schema the fold cannot tell them, so it removes the node or the field,
+    // and a reader takes the absence as empty.
+    if (row.action === 'remove' || (row.action === 'replace' && source == null)) {
       if (at.field.length) { const parent = getIn(nodes.get(at.node)?.value, at.field.slice(0, -1)); if (parent) delete parent[at.field.at(-1)!]; }
       else for (const key of [...nodes.keys()]) if (key === at.node || key.startsWith(at.node + '/')) nodes.delete(key);
       return;
     }
-
-    let source = row.value ? lookup(message, row.value) : payload;
-    if (row.action === 'replace' && row.value) source ??= []; // an absent or null list is []
-    else if (source === undefined || source === null) return; // the value is absent: not applied
+    if (source == null) return; // upsert and append: the value is absent, not applied
 
     const node = nodes.get(at.node) ?? { history: at.history, template: at.template, value: {} };
     nodes.set(at.node, node);
@@ -143,8 +147,8 @@ export class SessionStore {
   }
 
   private render(entity: string, node: Node): any {
-    for (const [kind, rows] of Object.entries(this.rows.updates)) {
-      for (const row of rows) {
+    for (const [kind, entry] of Object.entries(this.table.sessionUpdates)) {
+      for (const row of rowsOf(entry) ?? []) {
         if ((row.action !== 'upsert' && row.action !== 'replace') || split(row.path!, entity).template !== node.template) continue;
         const message: any = { update: {} };
         setField(message, row.value ?? 'update', copy(node.value));

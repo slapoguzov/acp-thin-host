@@ -1,24 +1,26 @@
-// x-state: one generic fold, rows read from the annotated schema.
+// x-state: one generic fold, rows read from the annotated schema and from the Agent's capabilities.schema.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionStore, withAgentRows } from '../src/state.ts';
-import { rowsFromSchema } from '../schema/rows.ts';
+import { SessionStore, agentEntries } from '../src/state.ts';
+import { rowsOf, tableFromSchema, withEntries } from '../schema/rows.ts';
 import { schema } from './fixture.ts';
 
-const rows = rowsFromSchema(schema);
+const table = tableFromSchema(schema);
+/** The host's table with an Agent's capabilities.schema over it. */
+const withAgent = (agentSchema: any) => withEntries(table, agentEntries(agentSchema));
 const text = (t: string) => ({ type: 'text', text: t });
 
-function fold(updates: any[], store = new SessionStore(rows)) {
+function fold(updates: any[], store = new SessionStore(table)) {
   for (const update of updates) store.applyUpdate({ sessionId: 's1', update });
   return store;
 }
 
-test('every update variant of the schema has a row', () => {
-  assert.equal(Object.keys(rows.updates).length, 25);
-  assert.deepEqual(Object.keys(rows.responses).sort(), ['session/delete', 'session/fork', 'session/new', 'session/resume', 'session/set_config_option', 'session/set_title']);
-  assert.deepEqual(Object.keys(rows.requests), ['session/request_permission']);
-  assert.equal(rows.updates.terminal_output_chunk[0].encoding, 'base64', 'the generator copied contentEncoding');
+test('the table of the schema: every update variant has a row, and seven methods change state', () => {
+  assert.equal(Object.keys(table.sessionUpdates).length, 25);
+  assert.deepEqual(Object.keys(table.methods).filter(method => table.methods[method]['x-state']).sort(),
+    ['session/delete', 'session/fork', 'session/new', 'session/request_permission', 'session/resume', 'session/set_config_option', 'session/set_title']);
+  assert.equal(rowsOf(table.sessionUpdates.terminal_output_chunk)![0].encoding, 'base64', 'the generator copied contentEncoding');
 });
 
 test('chunks append to their message; messages keep the order of first report', () => {
@@ -66,7 +68,7 @@ test('current values keep only the latest; responses replace lists; live-only up
 
 test('a custom update is stored by the row the Agent declares; without a row it stays raw', () => {
   const custom = { sessionUpdate: '_task_update', taskId: 'k1', status: 'open' };
-  const declared = new SessionStore(withAgentRows(rows, { sessionUpdates: { _task_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/_tasks/{update.taskId}' } } } }));
+  const declared = new SessionStore(withAgent({ sessionUpdates: { _task_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/_tasks/{update.taskId}' } } } }));
   fold([custom, { ...custom, status: 'done' }], declared);
   assert.deepEqual(declared.replay('s1').history, [{ sessionUpdate: '_task_update', taskId: 'k1', status: 'done' }]);
 
@@ -118,10 +120,54 @@ test('a row whose path field is absent is not applied', () => {
 });
 
 test('a custom row that writes an ACP node is ignored', () => {
-  const custom = withAgentRows(rows, { sessionUpdates: {
+  const custom = withAgent({ sessionUpdates: {
     _fixture_title: { 'x-state': { action: 'replace', path: '/sessions/{sessionId}/info', value: 'update.info' } },
     _fixture_task: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/_tasks/{update.taskId}' } },
   } });
-  assert.equal(custom.updates._fixture_title, undefined);
-  assert.ok(custom.updates._fixture_task);
+  assert.equal(custom.sessionUpdates._fixture_title, undefined);
+  assert.ok(custom.sessionUpdates._fixture_task);
+});
+
+test("the Agent's row for an ACP variant is used; other variants keep the host's own rows", () => {
+  const store = new SessionStore(withAgent({ sessionUpdates: {
+    session_info_update: { 'x-state': { action: 'replace', path: '/sessions/{sessionId}/info' } }, // a newer rule
+  } }));
+  fold([
+    { sessionUpdate: 'session_info_update', title: 'Old', updatedAt: 'T1' },
+    { sessionUpdate: 'session_info_update', updatedAt: 'T2' },
+    { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' },
+  ], store);
+  assert.deepEqual(store.current('s1', 'info'), { updatedAt: 'T2' }, "replace, the Agent's row, not the host's upsert");
+  assert.deepEqual(store.replay('s1').history, [{ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' }]);
+});
+
+test("a newer Agent: a variant and a response that the host's schema lacks are folded by the Agent's rows", () => {
+  const newer = {
+    sessionUpdates: { review_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/reviews/{update.reviewId}' } } },
+    methods: { 'session/set_goal': { 'x-state': { action: 'replace', path: '/sessions/{sessionId}/goal', value: 'result.goal' } } },
+  };
+  const review = (status: string) => ({ sessionUpdate: 'review_update', reviewId: 'r1', status });
+  const host = fold([review('open'), review('done')]);
+  assert.deepEqual(host.replay('s1').history, [review('open'), review('done')], 'without the Agent row: raw');
+
+  const store = fold([review('open'), review('done')], new SessionStore(withAgent(newer)));
+  store.applyResponse('session/set_goal', { sessionId: 's1' }, { goal: 'ship' });
+  assert.deepEqual(store.replay('s1').history, [review('done')]);
+  assert.equal(store.current('s1', 'goal'), 'ship');
+});
+
+test('replace with an absent or null value empties the node: a list and a title. upsert and append skip the row', () => {
+  const store = fold([
+    { sessionUpdate: 'session_info_update', title: 'Old', updatedAt: 'T1' },
+    { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'test' }] },
+    { sessionUpdate: 'available_commands_update', availableCommands: null },
+    { sessionUpdate: 'agent_message_chunk', messageId: 'a1' }, // append without content
+  ]);
+  store.applyResponse('session/set_config_option', { sessionId: 's1' }, { configOptions: [{ id: 'model' }] });
+  store.applyResponse('session/set_config_option', { sessionId: 's1' }, {});
+  store.applyResponse('session/set_title', { sessionId: 's1' }, {});
+  assert.equal(store.current('s1', 'commands'), undefined, 'an empty list');
+  assert.equal(store.current('s1', 'config'), undefined, 'an empty list');
+  assert.deepEqual(store.current('s1', 'info'), { updatedAt: 'T1' }, 'a title with no value');
+  assert.deepEqual(store.replay('s1').history, [], 'the chunk without content created no message');
 });

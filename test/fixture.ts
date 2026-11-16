@@ -21,6 +21,7 @@ export const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 export class Client {
   peer: Peer;
   received: Message[] = [];
+  initialized: any;
   answers = new Map<string, (params: any) => any>();
   constructor(peer: Peer) {
     this.peer = peer;
@@ -43,7 +44,7 @@ export class Client {
 export class FakeAgent {
   peer: Peer;
   calls: Message[] = [];
-  /** The capabilities.schema this Agent declares in initialize. */
+  /** The capabilities.schema this Agent returns in initialize when the Client asks for it. */
   agentSchema: any;
   prompts: (number | string)[] = [];
   private sessions = 0;
@@ -58,7 +59,7 @@ export class FakeAgent {
   }
   private result(message: Message) {
     switch (message.method) {
-      case 'initialize': return { protocolVersion: 2, info: { name: 'fake', version: '1' }, capabilities: { session: {}, ...(this.agentSchema ? { schema: this.agentSchema } : {}) } };
+      case 'initialize': return { protocolVersion: 2, info: { name: 'fake', version: '1' }, capabilities: { session: {}, ...(this.agentSchema && message.params?.capabilities?.schema ? { schema: this.agentSchema } : {}) } };
       case 'session/new': return { sessionId: `s${++this.sessions}`, configOptions: [{ id: 'model', currentValue: 'small' }], availableCommands: [] };
       default: return {};
     }
@@ -77,11 +78,12 @@ export function hostWith(options: { hostAgentSchema?: any; agentSchema?: any } =
   agent.agentSchema = options.agentSchema;
   const logs: string[] = [];
   const host = new ThinHost(hostSide, { schema, agentSchema: options.hostAgentSchema, log: line => logs.push(line) });
-  const client = async () => {
+  /** A Client after initialize; `capabilities` are its own, such as { schema: {} } to ask for the rows. */
+  const client = async (capabilities: any = {}) => {
     const [clientSide, serverSide] = pair();
     host.connect(serverSide);
     const c = new Client(clientSide);
-    await c.call('initialize', { protocolVersion: 2, info: { name: 'test', version: '1' }, capabilities: {} });
+    c.initialized = await c.call('initialize', { protocolVersion: 2, info: { name: 'test', version: '1' }, capabilities });
     return c;
   };
   return { host, agent, client, logs };

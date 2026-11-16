@@ -155,3 +155,26 @@ test('a permission request upserts the tool call it carries, and a joining Clien
   await b.call('session/resume', { sessionId, cwd: '/w', mcpServers: [], replayFrom: { type: 'start' } });
   assert.deepEqual(b.updates(sessionId).find(u => u.sessionUpdate === 'tool_call_update'), { sessionUpdate: 'tool_call_update', toolCallId: 't7', title: 'rm -rf build' });
 });
+
+test('the host asks the Agent for its rows, uses them first, and gives its table only to Clients that ask', async () => {
+  const newer = { // a newer Agent: a variant and a method that the host's schema lacks
+    sessionUpdates: { review_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/reviews/{update.reviewId}' } } },
+    methods: { 'review/notice': { 'x-audience': { resource: ['/sessions/{sessionId}'] } } },
+  };
+  const { agent, client, a, sessionId } = await sharedSession({ agentSchema: newer });
+  assert.deepEqual(agent.calls.find(m => m.method === 'initialize')!.params.capabilities, { schema: {} }, 'the host asks upstream');
+  assert.equal(a.initialized.capabilities.schema, undefined, 'A did not ask: no table');
+
+  agent.update(sessionId, { sessionUpdate: 'review_update', reviewId: 'r1', status: 'open' });
+  agent.update(sessionId, { sessionUpdate: 'review_update', reviewId: 'r1', status: 'done' });
+  await tick();
+  const b = await client({ schema: {} });
+  const table = b.initialized.capabilities.schema;
+  assert.ok(table.sessionUpdates.review_update && table.sessionUpdates.tool_call_update, "B asked: the Agent's rows and the host's own");
+  await b.call('session/resume', { sessionId, cwd: '/w', mcpServers: [], replayFrom: { type: 'start' } });
+  assert.deepEqual(b.updates(sessionId)[0], { sessionUpdate: 'review_update', reviewId: 'r1', status: 'done' }, 'folded by the Agent row');
+
+  agent.notify('review/notice', { sessionId, text: 'ready' });
+  await tick();
+  assert.deepEqual([a.got('review/notice').length, b.got('review/notice').length], [1, 1], 'delivered by the Agent audience');
+});
