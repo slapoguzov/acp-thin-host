@@ -97,8 +97,8 @@ export class ThinHost {
   private async clientRequest(connection: Connection, method: string, params: any, clientId: number | string): Promise<Message> {
     const sessionId: string | undefined = params?.sessionId;
 
-    if (method === 'initialize') { // one initialize upstream; every Client gets its result
-      this.initialize ??= this.agent.request(method, params).then(reply => {
+    if (method === 'initialize') { // one v2 initialize upstream; every Client gets its result
+      this.initialize ??= this.agent.request(method, { ...params, protocolVersion: 2 }).then(reply => {
         if (reply.error) this.initialize = undefined; // let the next Client try again
         else this.useAgentSchema(reply.result?.capabilities?.schema);
         return reply;
