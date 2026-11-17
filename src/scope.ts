@@ -1,34 +1,24 @@
-// Scope of Agent-to-Client methods from x-scope (RFD "Session state rules", section "Scope").
+// x-scope: what an Agent-to-Client message is about (RFD, "The x-scope annotation").
 //
 //   "elicitation/create": ["/requests/{requestId}", "/sessions/{sessionId}/toolCalls/{toolCallId}", "/sessions/{sessionId}"]
 //
-// The first path whose fields are all present in the params names the resource. Its first segment selects the kind;
-// a path may continue below it and is held as that resource. A custom first segment (_name) is held as "/".
-// This file knows no method by name: the scopes come from the same table as the rows, the host's own entries
-// with the Agent's `capabilities.schema.methods` over them (schema/rows.ts).
+// The scope is the first path whose fields are all present in the params. This file knows no method by name.
 
-import { lookup, parsePath } from './paths.ts';
-import type { Scope, SchemaTable } from '../schema/rows.ts';
+import { resolve } from './paths.ts';
+import type { Annotations } from './annotations.ts';
 
-export type { Scope };
-/** A resolved resource: the Agent ("/"), or a kind with an ID, such as { kind: "sessions", id: "s1" }. */
-export type Resource = { kind: 'root' } | { kind: string; field: string; id: string };
+/**
+ * The thing a message is about, by its first two segments: `{ kind: "sessions", id: "s1" }`, or `{ kind: "" }` for
+ * the Agent ("/"). A path below a session, such as one tool call, belongs to that session. `field` is the param
+ * that holds the ID.
+ */
+export type Scope = { kind: string; id: string; field: string };
 
-/** The resource kinds of the RFD table. Any other first segment that does not start with _ is reserved for ACP. */
-const KINDS = new Set(['sessions', 'requests', 'mcpServers', 'elicitations']);
-
-/** The resource a message belongs to, or null when the method has no declared resource. */
-export function resourceOf(table: SchemaTable, method: string, params: any): Resource | null {
-  for (const path of table.methods[method]?.['x-scope'] ?? []) {
-    const segments = parsePath(path);
-    if (segments.some(s => 'field' in s && lookup(params, s.field) == null)) continue; // a field is absent: next path
-    const [kind, id] = segments;
-    if (!kind) return { kind: 'root' };
-    if (!('name' in kind)) continue;
-    if (kind.name.startsWith('_')) return { kind: 'root' }; // a custom resource of the Agent is held as /
-    if (!KINDS.has(kind.name) || !id || !('field' in id)) continue; // reserved: no declared resource
-    const value = lookup(params, id.field);
-    if (typeof value === 'string' || typeof value === 'number') return { kind: kind.name, field: id.field, id: String(value) };
+export function scopeOf(annotations: Annotations, method: string, params: any): Scope | null {
+  for (const path of annotations.methods[method]?.['x-scope'] ?? []) {
+    const segments = resolve(path, params);
+    if (!segments) continue; // a field is absent: try the next, less specific path
+    return { kind: segments[0] ?? '', id: decodeURIComponent(segments[1] ?? ''), field: path.split('/')[2]?.slice(1, -1) ?? '' };
   }
   return null;
 }
