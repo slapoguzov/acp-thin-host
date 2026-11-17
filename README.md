@@ -105,7 +105,7 @@ annotations that the host uses.
 | [`src/paths.ts`](src/paths.ts) | 24 | The path grammar of both annotations |
 | [`src/annotations.ts`](src/annotations.ts) | 39 | Loads the table and puts the Agent's annotations over it |
 | [`src/host.ts`](src/host.ts) | 207 | The host: the session lifecycle and delivery by scope |
-| [`src/jsonrpc.ts`](src/jsonrpc.ts), [`src/main.ts`](src/main.ts), [`src/watch.ts`](src/watch.ts) | 139 | JSON-RPC over streams, the command line, and a terminal Client |
+| [`src/jsonrpc.ts`](src/jsonrpc.ts), [`src/main.ts`](src/main.ts), [`src/watch.ts`](src/watch.ts) | 140 | JSON-RPC over streams, the command line, and a terminal Client |
 | [`check.ts`](check.ts) | 75 | The generator rule of the RFD, run on the ACP schema |
 | [`demo.ts`](demo.ts), [`test/`](test) | 357 | The walk-through and 15 tests on a scripted Agent |
 
@@ -121,11 +121,65 @@ value. It found the new `cursor_update` variant on ACP main.
 
 ## Run with a real Agent
 
+```mermaid
+flowchart LR
+  E1[Editor 1] -- stdio --> C1["main.ts connect"]
+  E2[Editor 2] -- stdio --> C2["main.ts connect"]
+  W[watch.ts]
+  C1 -- Unix socket --> S
+  C2 -- Unix socket --> S
+  W -- Unix socket --> S
+  S["main.ts serve<br/>(the host)"] -- stdio --> G["claude-agent-acp<br/>(one process)"]
+```
+
+**1. Start the host.** `serve` starts the Agent and listens on a Unix socket, `/tmp/acp-thin-host.sock` by
+default. Keep it running in its own terminal:
+
 ```sh
 node src/main.ts serve -- npx -y @agentclientprotocol/claude-agent-acp@0.107.2
-node src/main.ts connect      # an ACP Agent on stdio for your editor; connect a second editor the same way
-node src/watch.ts             # or: a terminal Client that joins the latest session
+# [acp-thin-host] serving on /tmp/acp-thin-host.sock
 ```
+
+**2. Add the host to your editor as an ACP Agent.** You do not run `connect` yourself: the editor starts it like
+any ACP Agent on stdio, and `connect` copies stdin and stdout to the host socket. Each `connect` is one more
+Client of the same host and the same Agent process. For JetBrains Air, in `~/.jetbrains/acp.json`:
+
+```json
+{ "agent_servers": { "Shared via thin host": {
+    "command": "node",
+    "args": ["/absolute/path/to/acp-thin-host/src/main.ts", "connect"] } } }
+```
+
+With another socket, pass `--socket <path>` to both `serve` and `connect`.
+
+**3. Join from a second Client.** Open a chat in the editor, then join the same session from a terminal:
+
+```sh
+node src/watch.ts             # joins the latest session: the history from the host store, then live updates
+```
+
+`watch.ts` prints `--- the history above came from the host store; live from here ---` after the history. A typed
+line is a prompt, and a number answers a permission request; the editor then gets `$/cancel_request`. A second
+editor with the same entry works the same way.
+
+To see one exchange without an editor, send a line of JSON-RPC. The `sleep` keeps stdin open, because `connect`
+closes the connection when its stdin ends:
+
+```sh
+(echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"me","version":"1"},"capabilities":{"schema":{}}}}'; sleep 3) \
+  | node src/main.ts connect
+```
+
+The first line of output is the Agent's `initialize` result, with the annotations that the host uses in
+`capabilities.schema`.
+
+Things to know:
+
+- Start `serve` first. Without it, `connect` prints `no host on /tmp/acp-thin-host.sock` and exits, and the
+  editor reports that the Agent stopped.
+- The host speaks ACP v2 to the Agent and does not translate from v1. An editor must speak v2: JetBrains Air does,
+  behind a registry key. An editor that speaks only v1 will not work.
+- Restarting `serve` restarts the Agent and disconnects every Client.
 
 Checked with claude-agent-acp 0.107.2 over ACP v2: Client B joined a session and got the same config options and
 commands from the store as Client A got from `session/new`. The adapter does not declare `_auth/status_update` yet,
