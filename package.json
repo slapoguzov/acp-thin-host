@@ -2,11 +2,11 @@
   "name": "acp-thin-host",
   "private": true,
   "type": "module",
-  "description": "Thin ACP host: one Agent, several Clients, rules from x-state and x-scope schema data",
+  "description": "Reference implementation of the ACP x-state and x-scope annotations: one Agent, several Clients",
   "engines": { "node": ">=22.18" },
   "scripts": {
+    "demo": "node demo.ts",
     "test": "node --test 'test/*.test.ts'",
-    "serve": "node src/main.ts serve",
-    "connect": "node src/main.ts connect"
+    "check": "node check.ts"
   }
 }

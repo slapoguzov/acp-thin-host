@@ -1,90 +1,92 @@
-// Test helpers: in-memory connections and a scripted ACP v2 Agent.
+// Test helpers: in-memory connections, a scripted ACP v2 Agent and a recording Client.
 
 import { PassThrough } from 'node:stream';
 import { Peer, type Message } from '../src/jsonrpc.ts';
 import { ThinHost } from '../src/host.ts';
 
-import { annotatedSchema } from '../schema/annotate.ts';
+export const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+export const text = (t: string) => ({ type: 'text', text: t });
 
-/** The ACP schema with the rows of x-rows.json; the first run downloads it. */
-export const schema = await annotatedSchema();
+/** Sees every message on a connection, for the demo. */
+export type Trace = (from: string, to: string, message: Message) => void;
 
-/** Two Peers connected to each other in memory. */
-export function pair(): [Peer, Peer] {
+/** Two Peers connected in memory. With `trace`, every message between them is reported. */
+export function pair(names = ['', ''], trace?: Trace): [Peer, Peer] {
   const a = new PassThrough(), b = new PassThrough();
+  const tap = (stream: PassThrough, from: string, to: string) =>
+    stream.on('data', chunk => String(chunk).split('\n').filter(Boolean).forEach(line => trace!(from, to, JSON.parse(line))));
+  if (trace) { tap(b, names[0], names[1]); tap(a, names[1], names[0]); }
   return [new Peer(a, b), new Peer(b, a)];
 }
 
-export const tick = () => new Promise(resolve => setTimeout(resolve, 5));
-
-/** A Client that records everything it receives. `answers` maps an Agent-to-Client method to its result. */
-export class Client {
-  peer: Peer;
-  received: Message[] = [];
-  initialized: any;
-  answers = new Map<string, (params: any) => any>();
-  constructor(peer: Peer) {
-    this.peer = peer;
-    peer.onMessage = message => {
-      this.received.push(message);
-      const answer = message.id !== undefined && message.method ? this.answers.get(message.method) : undefined;
-      if (answer) peer.send({ id: message.id, result: answer(message.params) });
-    };
-  }
-  async call(method: string, params: any) {
-    const reply = await this.peer.request(method, params);
-    if (reply.error) throw Object.assign(new Error(reply.error.message), reply.error);
-    return reply.result;
-  }
-  updates(sessionId: string) { return this.received.filter(m => m.method === 'session/update' && m.params.sessionId === sessionId).map(m => m.params.update); }
-  got(method: string) { return this.received.filter(m => m.method === method); }
-}
-
-/** A scripted Agent: tests drive it with `notify` and `ask`; it records the requests it gets. */
+/** A scripted Agent. Tests drive it with `update`, `notify` and `ask`. A prompt runs until `endTurn`. */
 export class FakeAgent {
-  peer: Peer;
   calls: Message[] = [];
-  /** The capabilities.schema this Agent returns in initialize when the Client asks for it. */
-  agentSchema: any;
   prompts: (number | string)[] = [];
-  private sessions = 0;
+  /** The `capabilities.schema` it returns when the Client asks for annotations. */
+  annotations: any;
+  peer: Peer;
   constructor(peer: Peer) {
     this.peer = peer;
     peer.onMessage = message => {
-      if (message.method === undefined) return;
       this.calls.push(message);
-      if (message.method === 'session/prompt') this.prompts.push(message.id!); // a turn runs until `endTurn`
+      if (message.method === 'session/prompt') this.prompts.push(message.id!);
       else if (message.id !== undefined) peer.send({ id: message.id, result: this.result(message) });
     };
   }
-  private result(message: Message) {
-    switch (message.method) {
-      case 'initialize': return { protocolVersion: 2, info: { name: 'fake', version: '1' }, capabilities: { session: {}, ...(this.agentSchema && message.params?.capabilities?.schema ? { schema: this.agentSchema } : {}) } };
-      case 'session/new': return { sessionId: `s${++this.sessions}`, configOptions: [{ id: 'model', currentValue: 'small' }], availableCommands: [] };
-      default: return {};
-    }
+  private result({ method, params }: Message) {
+    if (method === 'initialize') return { protocolVersion: 2, info: { name: 'fake', version: '1' }, capabilities: { session: {}, ...(params.capabilities?.schema && this.annotations && { schema: this.annotations }) } };
+    if (method === 'session/new') return { sessionId: 's1', configOptions: [{ id: 'model', currentValue: 'small' }], availableCommands: [] };
+    if (method === 'session/list') return { sessions: [{ sessionId: 's1', cwd: '/repo' }] };
+    return {};
   }
-  endTurn() { this.peer.send({ id: this.prompts.shift(), result: { stopReason: 'end_turn' } }); }
   update(sessionId: string, update: any) { this.peer.send({ method: 'session/update', params: { sessionId, update } }); }
   notify(method: string, params: any) { this.peer.send({ method, params }); }
   ask(method: string, params: any) { return this.peer.request(method, params); }
+  endTurn() { this.peer.send({ id: this.prompts.shift(), result: { stopReason: 'end_turn' } }); }
   count(method: string) { return this.calls.filter(m => m.method === method).length; }
 }
 
-/** A host over a FakeAgent, and a way to connect Clients to it. */
-export function hostWith(options: { hostAgentSchema?: any; agentSchema?: any } = {}) {
-  const [agentSide, hostSide] = pair();
+/** A Client that records what it gets. */
+export class Client {
+  received: Message[] = [];
+  initialized: any;
+  peer: Peer;
+  constructor(peer: Peer) {
+    this.peer = peer;
+    peer.onMessage = message => this.received.push(message);
+  }
+  async call(method: string, params: any) {
+    const reply = await this.peer.request(method, params);
+    if (reply.error) throw new Error(reply.error.message);
+    return reply.result;
+  }
+  updates() { return this.received.filter(m => m.method === 'session/update').map(m => m.params.update); }
+  got(method: string) { return this.received.filter(m => m.method === method); }
+}
+
+/** A host over a FakeAgent. `client()` connects a Client and initializes it. */
+export function setup({ agentAnnotations, trace }: { agentAnnotations?: any; trace?: Trace } = {}) {
+  const [agentSide, hostSide] = pair(['agent', 'host'], trace);
   const agent = new FakeAgent(agentSide);
-  agent.agentSchema = options.agentSchema;
-  const logs: string[] = [];
-  const host = new ThinHost(hostSide, { schema, agentSchema: options.hostAgentSchema, log: line => logs.push(line) });
-  /** A Client after initialize; `capabilities` are its own, such as { schema: {} } to ask for the rows. */
-  const client = async (capabilities: any = {}) => {
-    const [clientSide, serverSide] = pair();
-    host.connect(serverSide);
+  agent.annotations = agentAnnotations;
+  const host = new ThinHost(hostSide);
+  const client = async (capabilities: any = {}, name = 'client') => {
+    const [clientSide, hostSide] = pair([name, 'host'], trace);
+    host.connect(hostSide);
     const c = new Client(clientSide);
-    c.initialized = await c.call('initialize', { protocolVersion: 2, info: { name: 'test', version: '1' }, capabilities });
+    c.initialized = await c.call('initialize', { protocolVersion: 2, info: { name, version: '1' }, capabilities });
     return c;
   };
-  return { host, agent, client, logs };
+  return { host, agent, client };
+}
+
+/** Client A has session s1; Client B joined it. */
+export async function twoClients(options = {}) {
+  const env = setup(options);
+  const a = await env.client();
+  await a.call('session/new', { cwd: '/w', mcpServers: [] });
+  const b = await env.client();
+  await b.call('session/resume', { sessionId: 's1', cwd: '/w', mcpServers: [] });
+  return { ...env, a, b };
 }

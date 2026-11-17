@@ -1,61 +1,57 @@
-// A second ACP Client for the demo: joins a session that another Client (Air) runs through the host.
+// A small terminal Client that joins a live session through the host.
 //
 //   node src/watch.ts [--socket /tmp/acp-thin-host.sock] [sessionId]
 //
-// Without a sessionId it joins the most recent session from session/list. It prints the history that the host
-// replays from its store, then the live stream. A typed line is sent as a prompt; when the Agent asks for
-// permission, the line chooses an option by its number.
+// It joins the given session, or the latest one from session/list, and prints the history that the host
+// sends from its store, then the live updates. A typed line is a prompt, or the number of a permission option.
 
 import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { Peer, type Message } from './jsonrpc.ts';
 
-const { values, positionals } = parseArgs({ allowPositionals: true, options: { socket: { type: 'string' } } });
-const stream = createConnection(values.socket ?? '/tmp/acp-thin-host.sock');
-const agent = new Peer(stream, stream);
-const say = (line: string) => process.stdout.write(line + '\n');
+const { values, positionals } = parseArgs({ allowPositionals: true, options: { socket: { type: 'string', default: '/tmp/acp-thin-host.sock' } } });
+const stream = createConnection(values.socket);
+const host = new Peer(stream, stream);
 let permission: Message | undefined;
 
-agent.onMessage = message => {
-  if (message.method === 'session/update') return say(describe(message.params.update));
-  if (message.method === 'session/request_permission') {
-    permission = message;
-    return say(`? ${message.params.title}\n${message.params.options.map((o: any, i: number) => `  ${i + 1}. ${o.name}`).join('\n')}`);
+const text = (content: any) => [content ?? []].flat().map((c: any) => c.text ?? `[${c.type}]`).join('');
+host.onMessage = ({ id, method, params }) => {
+  if (method === 'session/update') {
+    const u = params.update;
+    if (u.sessionUpdate.startsWith('user_message')) console.log(`> ${text(u.content)}`);
+    else if (u.sessionUpdate.startsWith('agent_message')) console.log(`  ${text(u.content)}`);
+    else if (u.sessionUpdate === 'tool_call_update') console.log(`  [${u.title ?? u.toolCallId}${u.status ? ': ' + u.status : ''}]`);
+    else if (u.sessionUpdate === 'replay_complete') console.log('--- the history above came from the host store; live from here ---');
+    else console.log(`  (${u.sessionUpdate})`);
+  } else if (method === 'session/request_permission') {
+    permission = { id, params };
+    console.log(`? permission\n${params.options.map((o: any, i: number) => `  ${i + 1}. ${o.name}`).join('\n')}`);
+  } else if (method === '$/cancel_request' && params.requestId === permission?.id) {
+    permission = undefined;
+    console.log('  (answered by another Client)');
+  } else if (method) {
+    console.log(`· ${method} ${JSON.stringify(params)}`);
   }
-  if (message.method === '$/cancel_request' && permission?.id === message.params.requestId) { permission = undefined; return say('  (answered by another client)'); }
-  if (message.method) say(`· ${message.method} ${JSON.stringify(message.params).slice(0, 120)}`);
 };
 
-function describe(update: any): string {
-  const text = (content: any) => [].concat(content ?? []).map((c: any) => c?.text ?? `[${c?.type}]`).join('');
-  switch (update.sessionUpdate) {
-    case 'user_message': case 'user_message_chunk': return `> ${text(update.content)}`;
-    case 'agent_message': case 'agent_message_chunk': return `  ${text(update.content)}`;
-    case 'tool_call_update': return `  [tool ${update.title ?? update.toolCallId}${update.status ? ': ' + update.status : ''}]`;
-    case 'state_update': return `  (${update.state})`;
-    case 'replay_complete': return '--- history above came from the host store; live from here ---';
-    default: return `  (${update.sessionUpdate})`;
-  }
-}
-
 const call = async (method: string, params: any) => {
-  const reply = await agent.request(method, params);
+  const reply = await host.request(method, params);
   if (reply.error) throw new Error(`${method}: ${reply.error.message}`);
   return reply.result;
 };
 
-await call('initialize', { protocolVersion: 2, info: { name: 'acp-watch', version: '1' }, capabilities: {} });
-const listed = await call('session/list', {});
-const session = positionals[0] ? listed.sessions.find((s: any) => s.sessionId === positionals[0]) : listed.sessions[0];
+await call('initialize', { protocolVersion: 2, info: { name: 'watch', version: '1' }, capabilities: {} });
+const { sessions } = await call('session/list', {});
+const session = sessions.find((s: any) => s.sessionId === (positionals[0] ?? s.sessionId));
 if (!session) throw new Error('no session to join');
-say(`joining ${session.sessionId} (${session.title ?? 'untitled'})`);
+console.log(`joining ${session.sessionId}`);
 await call('session/resume', { sessionId: session.sessionId, cwd: session.cwd, mcpServers: [], replayFrom: { type: 'start' } });
 
 createInterface({ input: process.stdin }).on('line', line => {
   if (permission) {
     const option = permission.params.options[Number(line) - 1];
-    agent.send({ id: permission.id, result: option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } } });
+    host.send({ id: permission.id, result: { outcome: option ? { outcome: 'selected', optionId: option.optionId } : { outcome: 'cancelled' } } });
     permission = undefined;
   } else if (line.trim()) {
     void call('session/prompt', { sessionId: session.sessionId, prompt: [{ type: 'text', text: line }] });

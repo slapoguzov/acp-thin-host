@@ -1,0 +1,57 @@
+{
+  "sessionUpdates": {
+    "user_message":              { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/messages/user/{update.messageId}" } },
+    "user_message_chunk":        { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/messages/user/{update.messageId}/content", "value": "update.content" } },
+    "agent_message":             { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/messages/agent/{update.messageId}" } },
+    "agent_message_chunk":       { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/messages/agent/{update.messageId}/content", "value": "update.content" } },
+    "agent_thought":             { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/messages/thought/{update.messageId}" } },
+    "agent_thought_chunk":       { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/messages/thought/{update.messageId}/content", "value": "update.content" } },
+    "session_message":           { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/messages/session/{update.messageId}" } },
+    "session_message_chunk":     { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/messages/session/{update.messageId}/content", "value": "update.content" } },
+    "tool_call_update":          { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/toolCalls/{update.toolCallId}" } },
+    "tool_call_content_chunk":   { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/toolCalls/{update.toolCallId}/content", "value": "update.content" } },
+    "terminal_update":           { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/terminals/{update.terminalId}" } },
+    "terminal_output_chunk":     { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/terminals/{update.terminalId}/output/data", "value": "update.data", "encoding": "base64" } },
+    "plan_update":               { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/plans/{update.plan.planId}", "value": "update.plan" } },
+    "plan_removed":              { "x-state": { "action": "remove",  "path": "/sessions/{sessionId}/plans/{update.planId}" } },
+    "compaction_update":         { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/compactions/{update.compactionId}" } },
+    "compaction_summary_chunk":  { "x-state": { "action": "append",  "path": "/sessions/{sessionId}/compactions/{update.compactionId}/summary", "value": "update.content" } },
+    "subagent_update":           { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/subagents/{update.sessionId}" } },
+    "cursor_update":             { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/cursors/{update.cursorId}" } },
+    "state_update":              { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/state" } },
+    "config_option_update":      { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/config", "value": "update.configOptions" } },
+    "available_commands_update": { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/commands", "value": "update.availableCommands" } },
+    "session_info_update":       { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/info" } },
+    "usage_update":              { "x-state": { "action": "upsert",  "path": "/sessions/{sessionId}/usage" } },
+    "notice":                    { "x-state": { "action": "none" } },
+    "replay_complete":           { "x-state": { "action": "none" } },
+    "prompt_suggestions_update": { "x-state": { "action": "none" } }
+  },
+  "methods": {
+    "session/new": { "x-state": [
+      { "action": "replace", "path": "/sessions/{result.sessionId}/config",   "value": "result.configOptions" },
+      { "action": "replace", "path": "/sessions/{result.sessionId}/commands", "value": "result.availableCommands" }
+    ] },
+    "session/fork": { "x-state": [
+      { "action": "replace", "path": "/sessions/{result.sessionId}/config",   "value": "result.configOptions" },
+      { "action": "replace", "path": "/sessions/{result.sessionId}/commands", "value": "result.availableCommands" }
+    ] },
+    "session/resume": { "x-state": [
+      { "action": "replace", "path": "/sessions/{sessionId}/config",   "value": "result.configOptions" },
+      { "action": "replace", "path": "/sessions/{sessionId}/commands", "value": "result.availableCommands" }
+    ] },
+    "session/set_config_option": { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/config", "value": "result.configOptions" } },
+    "session/set_title":         { "x-state": { "action": "replace", "path": "/sessions/{sessionId}/info/title", "value": "result.title" } },
+    "session/delete":            { "x-state": { "action": "remove",  "path": "/sessions/{sessionId}" } },
+
+    "session/request_permission": {
+      "x-state": { "action": "upsert", "path": "/sessions/{sessionId}/toolCalls/{subject.toolCall.toolCallId}", "value": "subject.toolCall" },
+      "x-scope": ["/sessions/{sessionId}/toolCalls/{subject.toolCall.toolCallId}", "/sessions/{sessionId}/toolCalls/{subject.toolCallId}", "/sessions/{sessionId}"]
+    },
+    "session/update":       { "x-scope": ["/sessions/{sessionId}"] },
+    "elicitation/create":   { "x-scope": ["/requests/{requestId}", "/sessions/{sessionId}/toolCalls/{toolCallId}", "/sessions/{sessionId}"] },
+    "elicitation/complete": { "x-scope": ["/elicitations/{elicitationId}"] },
+    "mcp/message":          { "x-scope": ["/mcpServers/{serverId}"] },
+    "auth/status_update":   { "x-scope": ["/"] }
+  }
+}

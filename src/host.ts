@@ -1,258 +1,200 @@
-// A thin ACP host: one Agent process, several Client connections that share its sessions.
-// Rules are those of the internal document "Thin ACP host: behavior".
+// A thin ACP host: one Agent process, several Clients that share its sessions.
 //
-// The host has code for the session lifecycle only (initialize, session/new|fork|resume|close, session/prompt).
-// Everything about update variants and Agent-to-Client methods comes from one table of schema data, in the shape of
-// initialize `capabilities.schema`. The host asks the Agent for its table in initialize and, for each message, uses
-// the Agent's entry, else its own, built from the schema it was started with ("Where the rows come from"):
-//   - x-state  -> `SessionStore` keeps each session's state and answers a joining Client's session/resume;
-//   - x-scope  -> `resourceOf` says which connections hold a message. Who may answer is host policy: here every
-//                 connection that holds the resource, because one user is behind all connections; the first answer wins.
-// New ACP variants and methods, also ones newer than the host's schema, and custom ones need no host code.
+// The host has code for the session lifecycle only. Everything about update variants and Agent-to-Client methods
+// comes from the annotations: ours (annotations.json) with the Agent's `capabilities.schema` over them.
+//   x-state -> SessionStore keeps each session, and answers session/resume for a Client that joins a live session.
+//   x-scope -> scopeOf says what a message is about, and the host sends it to the Clients that hold that thing.
+// Who may answer a request is host policy. Here one user is behind all Clients, so every Client that holds the
+// scope sees the request and the first answer wins.
 
 import { Peer, type Message } from './jsonrpc.ts';
-import { SessionStore, agentEntries } from './state.ts';
-import { tableFromSchema, withEntries, type SchemaTable } from '../schema/rows.ts';
-import { resourceOf, type Resource } from './scope.ts';
-import { lookup } from './paths.ts';
+import { SessionStore } from './state.ts';
+import { scopeOf, type Scope } from './scope.ts';
+import { acpAnnotations, withAgentAnnotations, type Annotations } from './annotations.ts';
 
-type Connection = { id: number; peer: Peer };
-
-/** An Agent-to-Client request while it waits for an answer. */
-type Pending = { agentId: number | string; method: string; params: any; shownTo: Map<Connection, number>; errors: Map<Connection, Message>; done: boolean };
-
-export type HostOptions = { schema: any; agentSchema?: any; log?: (line: string) => void };
+/** An Agent-to-Client request while it waits: the ID that each Client got, and the Clients that answered with an error. */
+type Pending = { method: string; params: any; shownTo: Map<Peer, number>; failed: Set<Peer> };
 
 export class ThinHost {
+  annotations: Annotations = acpAnnotations;
+  store = new SessionStore(this.annotations);
+  private initialized?: Promise<Message>;
+  private clients = new Set<Peer>();
+  /** sessionId -> Clients where the session is active. The /sessions scope. */
+  private sessions = new Map<string, Set<Peer>>();
+  /** Our ID of a Client request in flight -> the Client and its own ID. The /requests scope. */
+  private requests = new Map<number, { client: Peer; id: number | string }>();
+  /** elicitationId -> Clients that got its elicitation/create. The /elicitations scope. */
+  private elicitations = new Map<string, Set<Peer>>();
+  /** The Agent's request ID -> the request. */
+  private pending = new Map<number | string, Pending>();
+  private nextId = 1;
+
   private agent: Peer;
   private log: (line: string) => void;
-  /** The host's own entries: its schema, plus a configured `capabilities.schema` for Agents that send none yet. */
-  private bundled: SchemaTable;
-  /** The entries in use: the Agent's over the host's own. Clients that ask get this table. */
-  table: SchemaTable;
-  private initialize?: Promise<Message>;
-  private nextConnection = 1;
-  private nextDownstreamId = 1;
 
-  store: SessionStore;
-  /** sessionId -> connections where the session is active. */
-  active = new Map<string, Set<Connection>>();
-  /** Upstream ID of a Client request in flight -> the connection and its own ID (the /requests resource). */
-  private requests = new Map<number, { connection: Connection; id: number | string }>();
-  /** elicitationId -> connections that got its elicitation/create (the /elicitations resource). */
-  private elicitations = new Map<string, Set<Connection>>();
-  private pending = new Map<number | string, Pending>();
-  private connections = new Set<Connection>();
-
-  constructor(agent: Peer, options: HostOptions) {
+  constructor(agent: Peer, log: (line: string) => void = () => {}) {
     this.agent = agent;
-    this.log = options.log ?? (() => {});
-    this.bundled = withEntries(tableFromSchema(options.schema), agentEntries(options.agentSchema));
-    this.table = this.bundled;
-    this.store = new SessionStore(this.table);
+    this.log = log;
     agent.onMessage = message => this.fromAgent(message);
   }
 
-  /** For each message, the Agent's entry from its `capabilities.schema`, else the host's own. */
-  private useAgentSchema(fromAgent: any) {
-    this.table = this.store.table = withEntries(this.bundled, agentEntries(fromAgent));
+  connect(client: Peer) {
+    this.clients.add(client);
+    client.onMessage = message => this.fromClient(client, message);
+    client.onClose = () => this.disconnect(client);
   }
 
-  /** The initialize result for one Client: the table in use when the Client set `capabilities.schema`, else no table. */
-  private initializeResult(params: any, result: any) {
-    const { schema, ...capabilities } = result.capabilities ?? {};
-    return { ...result, capabilities: params?.capabilities?.schema ? { ...capabilities, schema: this.table } : capabilities };
-  }
+  // ------------------------------------------------------------------ Client -> Agent
 
-  connect(peer: Peer): Connection {
-    const connection: Connection = { id: this.nextConnection++, peer };
-    this.connections.add(connection);
-    peer.onMessage = message => this.fromClient(connection, message);
-    peer.onClose = () => this.disconnect(connection);
-    this.log(`client ${connection.id} connected`);
-    return connection;
-  }
-
-  // ---------------------------------------------------------------- Client -> Agent
-
-  private async fromClient(connection: Connection, message: Message) {
-    if (message.method === undefined) return this.answer(connection, message);
-    if (message.method === '$/cancel_request') { // the Client names its own request ID: give the Agent its upstream ID
-      const upstream = [...this.requests].find(([, owner]) => owner.connection === connection && owner.id === message.params?.requestId)?.[0];
-      if (upstream !== undefined) this.agent.send({ method: message.method, params: { ...message.params, requestId: upstream } });
+  private async fromClient(client: Peer, message: Message) {
+    if (message.method === undefined) return this.answer(client, message);
+    if (message.method === '$/cancel_request') { // the Client names its own ID; the Agent knows ours
+      const ours = [...this.requests].find(([, r]) => r.client === client && r.id === message.params.requestId)?.[0];
+      if (ours !== undefined) this.agent.send({ method: message.method, params: { requestId: ours } });
       return;
     }
-    if (message.id === undefined) return this.agent.send({ method: message.method, params: message.params }); // session/cancel and others
-    let reply: Message;
-    try {
-      reply = await this.clientRequest(connection, message.method, message.params, message.id);
-    } catch (error: any) {
-      reply = { error: { code: -32603, message: String(error?.message ?? error) } };
-    }
-    connection.peer.send({ id: message.id, ...(reply.error ? { error: reply.error } : { result: reply.result }) });
+    if (message.id === undefined) return this.agent.send(message); // session/cancel and other notifications
+    const reply = await this.request(client, message.method, message.params, message.id)
+      .catch((error): Message => ({ error: { code: -32603, message: String(error) } }));
+    client.send({ id: message.id, ...(reply.error ? { error: reply.error } : { result: reply.result }) });
   }
 
-  private async clientRequest(connection: Connection, method: string, params: any, clientId: number | string): Promise<Message> {
+  private async request(client: Peer, method: string, params: any, clientId: number | string): Promise<Message> {
     const sessionId: string | undefined = params?.sessionId;
+    const holders = sessionId ? this.holders(sessionId) : new Set<Peer>();
 
-    if (method === 'initialize') { // one v2 initialize upstream that asks for the Agent's rows; every Client gets its result
-      const upstream = { ...params, protocolVersion: 2, capabilities: { ...params?.capabilities, schema: {} } };
-      this.initialize ??= this.agent.request(method, upstream).then(reply => {
-        if (reply.error) this.initialize = undefined; // let the next Client try again
-        else this.useAgentSchema(reply.result?.capabilities?.schema);
-        return reply;
-      });
-      const reply = await this.initialize;
-      return reply.error ? reply : { result: this.initializeResult(params, reply.result) };
-    }
-    if (method === 'session/resume' && sessionId && this.holders(sessionId).size > 0) {
-      return this.join(connection, sessionId, params); // the session is live on another connection: answer from the store
-    }
-    if (method === 'session/close' && sessionId && [...this.holders(sessionId)].some(other => other !== connection)) {
-      this.holders(sessionId).delete(connection); // others still use it: do not close it in the Agent
-      return { result: {} };
+    if (method === 'initialize') return this.initialize(params);
+    if (method === 'session/resume' && holders.size > 0) return this.join(client, sessionId!, params);
+    if (method === 'session/close' && [...holders].some(other => other !== client)) { holders.delete(client); return { result: {} }; }
+    if (method === 'session/resume') {
+      if (params.replayFrom) this.store.forget(sessionId!); // the Agent sends the whole history again
+      holders.add(client); // the replay goes to this Client
     }
 
-    if (method === 'session/resume' && sessionId) {
-      if (params.replayFrom) this.store.nodes(sessionId).clear(); // a full replay is authoritative
-      this.holders(sessionId).add(connection); // the replay goes to the connection that asked for it
-    }
+    let ours = 0;
+    const reply = await this.agent.request(method, params, id => { ours = id; this.requests.set(id, { client, id: clientId }); });
+    this.requests.delete(ours);
+    if (reply.error) { if (method === 'session/resume') holders.delete(client); return reply; }
 
-    let upstreamId = 0;
-    const reply = await this.agent.request(method, params, id => { upstreamId = id; this.requests.set(id, { connection, id: clientId }); });
-    this.requests.delete(upstreamId);
-
-    if (reply.error) {
-      if (method === 'session/resume' && sessionId) this.holders(sessionId).delete(connection);
-      return reply;
-    }
-    this.store.applyResponse(method, params, reply.result);
-    const created = method === 'session/new' || method === 'session/fork' ? reply.result?.sessionId : undefined;
-    if (created) this.holders(created).add(connection);
-    if (method === 'session/close' && sessionId) this.holders(sessionId).delete(connection);
-    if (created || method === 'session/resume') this.showPendingTo(connection, created ?? sessionId!);
+    this.store.applyResponse(method, params, reply.result); // x-state of a response, such as the options of session/new
+    const created = method === 'session/new' || method === 'session/fork' ? reply.result.sessionId : undefined;
+    if (created) this.holders(created).add(client);
+    if (method === 'session/close') holders.delete(client);
+    if (created || method === 'session/resume') this.showPending(client, created ?? sessionId);
     return reply;
   }
 
   /**
-   * session/resume for a session that is already live: history (when replay is requested), replay_complete,
-   * current values, and state_update last. The response carries the lists from the store.
+   * The first initialize goes to the Agent and asks for its annotations (`capabilities.schema: {}`). A Client that
+   * asks for annotations gets the ones the host uses: ours with the Agent's over them.
    */
-  private join(connection: Connection, sessionId: string, params: any): Message {
+  private async initialize(params: any): Promise<Message> {
+    this.initialized ??= this.agent.request('initialize', { ...params, protocolVersion: 2, capabilities: { ...params.capabilities, schema: {} } });
+    const reply = await this.initialized;
+    if (reply.error) { this.initialized = undefined; return reply; }
+    const { schema: fromAgent, ...capabilities } = reply.result.capabilities ?? {};
+    this.annotations = this.store.annotations = withAgentAnnotations(acpAnnotations, fromAgent);
+    if (params.capabilities?.schema) capabilities.schema = this.annotations;
+    return { result: { ...reply.result, capabilities } };
+  }
+
+  /** session/resume of a session that is live on another Client, answered from the store. The Agent is not asked. */
+  private join(client: Peer, sessionId: string, params: any): Message {
     const { history, current } = this.store.replay(sessionId);
-    const send = (update: any) => connection.peer.send({ method: 'session/update', params: { sessionId, update } });
+    const send = (update: any) => client.send({ method: 'session/update', params: { sessionId, update } });
     if (params.replayFrom) history.forEach(send);
     send({ sessionUpdate: 'replay_complete' });
     current.filter(update => update.sessionUpdate !== 'state_update').forEach(send);
     current.filter(update => update.sessionUpdate === 'state_update').forEach(send);
-    this.holders(sessionId).add(connection);
-    this.showPendingTo(connection, sessionId);
-    this.log(`client ${connection.id} joined ${sessionId}: ${params.replayFrom ? history.length : 0} history updates from the store`);
+    this.holders(sessionId).add(client);
+    this.showPending(client, sessionId);
+    this.log(`a Client joined ${sessionId}: ${params.replayFrom ? history.length : 0} history updates from the store`);
     return { result: { configOptions: this.store.current(sessionId, 'config') ?? [], availableCommands: this.store.current(sessionId, 'commands') ?? [] } };
   }
 
-  // ---------------------------------------------------------------- Agent -> Clients
+  // ------------------------------------------------------------------ Agent -> Clients
 
-  private fromAgent(message: Message) {
-    if (message.method === '$/cancel_request') return this.withdraw(this.pending.get(message.params?.requestId));
-    if (message.method === 'session/update') this.store.applyUpdate(message.params);
-    else if (message.id !== undefined) this.store.applyRequest(message.method!, message.params); // a permission request carries its tool call
+  private fromAgent({ id, method, params }: Message) {
+    if (method === undefined) return;
+    if (method === '$/cancel_request') return this.close(params.requestId);
+    if (method === 'session/update') this.store.applyUpdate(params);
+    else if (id !== undefined) this.store.applyRequest(method, params); // a permission request reports its tool call
 
-    const resource = resourceOf(this.table, message.method!, message.params);
-    const holders = resource ? this.connectionsHolding(resource) : [];
+    const scope = scopeOf(this.annotations, method, params);
+    if (!scope) this.log(`${method} has no x-scope: not delivered`);
+    const to = scope ? this.holdersOf(scope) : [];
 
-    if (message.id === undefined) { // notification: every connection that holds the resource
-      if (!resource) this.log(`dropped ${message.method}: no scope`);
-      for (const connection of holders) connection.peer.send({ method: message.method, params: this.paramsFor(connection, resource!, message.params) });
-      return;
-    }
-    if (!resource) {
-      this.log(`refused ${message.method}: no scope`);
-      return this.agent.send({ id: message.id, error: { code: -32601, message: `${message.method} has no scope` } });
-    }
-    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, shownTo: new Map(), errors: new Map(), done: false };
-    this.pending.set(message.id, request);
-    // Host policy for one user behind all connections: every holder sees it, the first answer wins.
-    const to = holders;
-    if (!to.length) return this.finish(request, { error: { code: -32603, message: 'no connection holds the resource' } });
-    for (const connection of to) this.show(request, connection, resource);
+    if (id === undefined) { for (const client of to) client.send({ method, params: this.paramsFor(client, scope!, params) }); return; }
+    if (!to.length) return this.agent.send({ id, error: { code: -32603, message: `no Client holds the scope of ${method}` } });
+    const request: Pending = { method, params, shownTo: new Map(), failed: new Set() };
+    this.pending.set(id, request);
+    for (const client of to) this.show(request, client, scope!);
   }
 
-  private show(request: Pending, connection: Connection, resource: Resource) {
-    const id = this.nextDownstreamId++;
-    request.shownTo.set(connection, id);
-    const elicitationId = request.params?.elicitationId; // remember who got it: the /elicitations resource
-    if (typeof elicitationId === 'string') this.elicitations.set(elicitationId, (this.elicitations.get(elicitationId) ?? new Set()).add(connection));
-    connection.peer.send({ id, method: request.method, params: this.paramsFor(connection, resource, request.params) });
+  private show(request: Pending, client: Peer, scope: Scope) {
+    const id = this.nextId++;
+    request.shownTo.set(client, id);
+    const elicitationId = request.params?.elicitationId; // a later elicitation/complete goes to the same Clients
+    if (typeof elicitationId === 'string') this.elicitations.set(elicitationId, (this.elicitations.get(elicitationId) ?? new Set()).add(client));
+    client.send({ id, method: request.method, params: this.paramsFor(client, scope, request.params) });
   }
 
-  /** A Client answers an Agent-to-Client request. */
-  private answer(connection: Connection, message: Message) {
-    const request = [...this.pending.values()].find(p => p.shownTo.get(connection) === message.id);
-    if (!request || request.done) return; // late answer of a request that another connection answered
-    if (message.error) {
-      request.errors.set(connection, message);
-      if (request.errors.size < request.shownTo.size) return; // others may still answer
-    }
-    this.finish(request, message, connection);
+  /** A Client answers. The first answer wins; an error wins only when every Client that saw the request failed. */
+  private answer(client: Peer, message: Message) {
+    const [agentId, request] = [...this.pending].find(([, r]) => r.shownTo.get(client) === message.id) ?? [];
+    if (!request) return; // another Client answered first
+    if (message.error) { request.failed.add(client); if (request.failed.size < request.shownTo.size) return; }
+    this.agent.send({ id: agentId, ...(message.error ? { error: message.error } : { result: message.result }) });
+    this.close(agentId!, client);
   }
 
-  private finish(request: Pending, reply: Message, winner?: Connection) {
-    request.done = true;
-    this.pending.delete(request.agentId);
-    this.agent.send({ id: request.agentId, ...(reply.error ? { error: reply.error } : { result: reply.result }) });
-    for (const [connection, id] of request.shownTo) if (connection !== winner) connection.peer.send({ method: '$/cancel_request', params: { requestId: id } });
+  /** The request is over. The other Clients that saw it get `$/cancel_request`. */
+  private close(agentId: number | string, except?: Peer) {
+    const request = this.pending.get(agentId);
+    this.pending.delete(agentId);
+    for (const [client, id] of request?.shownTo ?? []) if (client !== except) client.send({ method: '$/cancel_request', params: { requestId: id } });
   }
 
-  private withdraw(request?: Pending) {
-    if (!request) return;
-    request.done = true;
-    this.pending.delete(request.agentId);
-    for (const [connection, id] of request.shownTo) connection.peer.send({ method: '$/cancel_request', params: { requestId: id } });
-  }
-
-  /** A connection that joins a session also gets the session's pending requests. */
-  private showPendingTo(connection: Connection, sessionId: string) {
+  /** A Client that joins a session also sees the requests that wait in it. */
+  private showPending(client: Peer, sessionId: string) {
     for (const request of this.pending.values()) {
-      const resource = resourceOf(this.table, request.method, request.params);
-      if (resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
+      const scope = scopeOf(this.annotations, request.method, request.params);
+      if (scope?.kind === 'sessions' && scope.id === sessionId && !request.shownTo.has(client)) this.show(request, client, scope);
     }
   }
 
-  // ---------------------------------------------------------------- resources
+  // ------------------------------------------------------------------ scopes
 
-  holders(sessionId: string): Set<Connection> {
-    if (!this.active.has(sessionId)) this.active.set(sessionId, new Set());
-    return this.active.get(sessionId)!;
+  /** The Clients that hold what a message is about. */
+  private holdersOf(scope: Scope): Peer[] {
+    if (scope.kind === 'sessions') return [...this.holders(scope.id)];
+    if (scope.kind === 'requests') { const r = this.requests.get(Number(scope.id)); return r ? [r.client] : []; }
+    if (scope.kind === 'elicitations') return [...(this.elicitations.get(scope.id) ?? [])];
+    if (scope.kind === '' || scope.kind.startsWith('_')) return [...this.clients]; // the Agent, or a custom thing of the Agent
+    return []; // mcpServers: MCP over ACP is not supported here
   }
 
-  private connectionsHolding(resource: Resource): Connection[] {
-    if (resource.kind === 'root') return [...this.connections]; // one local user: every connection may see Agent-level state
-    const { kind, id } = resource as { kind: string; id: string };
-    if (kind === 'sessions') return [...this.holders(id)];
-    if (kind === 'requests') { const owner = this.requests.get(Number(id)); return owner ? [owner.connection] : []; }
-    if (kind === 'elicitations') return [...(this.elicitations.get(id) ?? [])];
-    return []; // mcpServers: MCP over ACP is not supported by this host
+  /** A /requests ID is ours. The Client gets its own ID back. */
+  private paramsFor(client: Peer, scope: Scope, params: any) {
+    const r = scope.kind === 'requests' ? this.requests.get(Number(scope.id)) : undefined;
+    return r?.client === client ? { ...params, [scope.field]: r.id } : params;
   }
 
-  /** IDs under /requests are per connection: give the Client its own request ID back. */
-  private paramsFor(connection: Connection, resource: Resource, params: any) {
-    if (resource.kind !== 'requests') return params;
-    const { field, id } = resource as { field: string; id: string };
-    const owner = this.requests.get(Number(id));
-    return owner?.connection === connection && lookup(params, field) !== undefined ? { ...params, [field]: owner.id } : params;
+  private holders(sessionId: string): Set<Peer> {
+    if (!this.sessions.has(sessionId)) this.sessions.set(sessionId, new Set());
+    return this.sessions.get(sessionId)!;
   }
 
-  private disconnect(connection: Connection) {
-    this.connections.delete(connection);
-    for (const holders of this.active.values()) holders.delete(connection);
-    for (const holders of this.elicitations.values()) holders.delete(connection);
-    for (const request of [...this.pending.values()]) {
-      if (!request.shownTo.delete(connection)) continue;
-      request.errors.delete(connection);
-      if (request.shownTo.size === 0) this.finish(request, { error: { code: -32603, message: 'the connection that held the request closed' } });
-      else if (request.errors.size === request.shownTo.size) this.finish(request, request.errors.values().next().value!); // the rest answered with errors
+  private disconnect(client: Peer) {
+    this.clients.delete(client);
+    for (const holders of [...this.sessions.values(), ...this.elicitations.values()]) holders.delete(client);
+    for (const [agentId, request] of [...this.pending]) {
+      if (!request.shownTo.delete(client)) continue;
+      request.failed.delete(client);
+      if (request.failed.size < request.shownTo.size) continue; // someone can still answer
+      this.pending.delete(agentId);
+      this.agent.send({ id: agentId, error: { code: -32603, message: 'no Client can answer the request any more' } });
     }
-    this.log(`client ${connection.id} disconnected`);
   }
 }

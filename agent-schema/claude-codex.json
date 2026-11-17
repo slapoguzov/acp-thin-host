@@ -1,6 +1,0 @@
-{
-  "$comment": "The capabilities.schema that claude-agent-acp and codex-acp would send in initialize. They send none yet, so the host is given it.",
-  "methods": {
-    "_auth/status_update": { "x-scope": ["/"] }
-  }
-}
