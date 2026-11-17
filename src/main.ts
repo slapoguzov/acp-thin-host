@@ -29,6 +29,7 @@ if (mode === 'serve' && split > 0) {
   createServer(stream => host.connect(new Peer(stream, stream))).listen(values.socket, () => log(`serving on ${values.socket}`));
 } else if (mode === 'connect') {
   const stream = createConnection(values.socket);
+  stream.on('error', error => { log(`no host on ${values.socket}: ${error.message}`); process.exit(1); });
   process.stdin.pipe(stream).pipe(process.stdout);
   stream.on('close', () => process.exit(0));
 } else {
