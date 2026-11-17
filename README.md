@@ -65,16 +65,19 @@ behind all Clients.
 ```mermaid
 sequenceDiagram
   participant A as Client A
-  participant H as host
   participant B as Client B
+  participant H as host
   participant G as Agent
-  G->>H: session/request_permission (s1, tool call t2)
-  Note over H: x-scope /sessions/s1/toolCalls/t2<br/>A and B hold s1
-  H->>A: session/request_permission
-  H->>B: session/request_permission
-  B->>H: allow
+  G->>H: session/request_permission<br/>(session s1, tool call t2)
+  Note over H: x-scope: /sessions/s1/toolCalls/t2<br/>A and B hold s1
+  par shown to every Client of s1
+    H->>A: session/request_permission
+  and
+    H->>B: session/request_permission
+  end
+  B->>H: allow (the first answer)
   H->>G: allow
-  H->>A: $/cancel_request
+  H->>A: $/cancel_request (B answered)
 ```
 
 ## Annotations in `initialize`
