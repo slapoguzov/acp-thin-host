@@ -6,19 +6,20 @@
 // initialize `capabilities.schema`. The host asks the Agent for its table in initialize and, for each message, uses
 // the Agent's entry, else its own, built from the schema it was started with ("Where the rows come from"):
 //   - x-state  -> `SessionStore` keeps each session's state and answers a joining Client's session/resume;
-//   - x-audience -> `resourceOf` says which connections hold a message, and who may answer a request.
+//   - x-scope  -> `resourceOf` says which connections hold a message. Who may answer is host policy: here every
+//                 connection that holds the resource, because one user is behind all connections; the first answer wins.
 // New ACP variants and methods, also ones newer than the host's schema, and custom ones need no host code.
 
 import { Peer, type Message } from './jsonrpc.ts';
 import { SessionStore, agentEntries } from './state.ts';
 import { tableFromSchema, withEntries, type SchemaTable } from '../schema/rows.ts';
-import { bindsToResource, resourceOf, type Resource } from './audience.ts';
+import { resourceOf, type Resource } from './scope.ts';
 import { lookup } from './paths.ts';
 
 type Connection = { id: number; peer: Peer };
 
 /** An Agent-to-Client request while it waits for an answer. */
-type Pending = { agentId: number | string; method: string; params: any; toResource: boolean; shownTo: Map<Connection, number>; errors: Map<Connection, Message>; done: boolean };
+type Pending = { agentId: number | string; method: string; params: any; shownTo: Map<Connection, number>; errors: Map<Connection, Message>; done: boolean };
 
 export type HostOptions = { schema: any; agentSchema?: any; log?: (line: string) => void };
 
@@ -36,8 +37,6 @@ export class ThinHost {
   store: SessionStore;
   /** sessionId -> connections where the session is active. */
   active = new Map<string, Set<Connection>>();
-  /** sessionId -> the connection that sent its latest prompt. In v2 the prompt response only accepts the turn. */
-  private prompter = new Map<string, Connection>();
   /** Upstream ID of a Client request in flight -> the connection and its own ID (the /requests resource). */
   private requests = new Map<number, { connection: Connection; id: number | string }>();
   /** elicitationId -> connections that got its elicitation/create (the /elicitations resource). */
@@ -118,7 +117,6 @@ export class ThinHost {
       if (params.replayFrom) this.store.nodes(sessionId).clear(); // a full replay is authoritative
       this.holders(sessionId).add(connection); // the replay goes to the connection that asked for it
     }
-    if (method === 'session/prompt' && sessionId) this.prompter.set(sessionId, connection);
 
     let upstreamId = 0;
     const reply = await this.agent.request(method, params, id => { upstreamId = id; this.requests.set(id, { connection, id: clientId }); });
@@ -164,20 +162,18 @@ export class ThinHost {
     const holders = resource ? this.connectionsHolding(resource) : [];
 
     if (message.id === undefined) { // notification: every connection that holds the resource
-      if (!resource) this.log(`dropped ${message.method}: no audience`);
+      if (!resource) this.log(`dropped ${message.method}: no scope`);
       for (const connection of holders) connection.peer.send({ method: message.method, params: this.paramsFor(connection, resource!, message.params) });
       return;
     }
     if (!resource) {
-      this.log(`refused ${message.method}: no audience`);
-      return this.agent.send({ id: message.id, error: { code: -32601, message: `${message.method} has no audience` } });
+      this.log(`refused ${message.method}: no scope`);
+      return this.agent.send({ id: message.id, error: { code: -32601, message: `${message.method} has no scope` } });
     }
-    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, toResource: bindsToResource(this.table, message.method!), shownTo: new Map(), errors: new Map(), done: false };
+    const request: Pending = { agentId: message.id, method: message.method!, params: message.params, shownTo: new Map(), errors: new Map(), done: false };
     this.pending.set(message.id, request);
-    // binding "resource": show it to every holder, the first answer wins. binding "connection": one connection,
-    // the one that sent the session's latest prompt, else the first holder.
-    const prompter = resource.kind === 'sessions' ? this.prompter.get((resource as any).id) : undefined;
-    const to = request.toResource ? holders : [holders.find(c => c === prompter) ?? holders[0]].filter(Boolean);
+    // Host policy for one user behind all connections: every holder sees it, the first answer wins.
+    const to = holders;
     if (!to.length) return this.finish(request, { error: { code: -32603, message: 'no connection holds the resource' } });
     for (const connection of to) this.show(request, connection, resource);
   }
@@ -194,7 +190,7 @@ export class ThinHost {
   private answer(connection: Connection, message: Message) {
     const request = [...this.pending.values()].find(p => p.shownTo.get(connection) === message.id);
     if (!request || request.done) return; // late answer of a request that another connection answered
-    if (message.error && request.toResource) {
+    if (message.error) {
       request.errors.set(connection, message);
       if (request.errors.size < request.shownTo.size) return; // others may still answer
     }
@@ -215,11 +211,11 @@ export class ThinHost {
     for (const [connection, id] of request.shownTo) connection.peer.send({ method: '$/cancel_request', params: { requestId: id } });
   }
 
-  /** A connection that joins a session also gets its pending requests that are bound to the session, not a connection. */
+  /** A connection that joins a session also gets the session's pending requests. */
   private showPendingTo(connection: Connection, sessionId: string) {
     for (const request of this.pending.values()) {
       const resource = resourceOf(this.table, request.method, request.params);
-      if (request.toResource && resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
+      if (resource?.kind === 'sessions' && (resource as any).id === sessionId && !request.shownTo.has(connection)) this.show(request, connection, resource);
     }
   }
 
@@ -249,7 +245,6 @@ export class ThinHost {
 
   private disconnect(connection: Connection) {
     this.connections.delete(connection);
-    for (const [sessionId, prompter] of this.prompter) if (prompter === connection) this.prompter.delete(sessionId);
     for (const holders of this.active.values()) holders.delete(connection);
     for (const holders of this.elicitations.values()) holders.delete(connection);
     for (const request of [...this.pending.values()]) {

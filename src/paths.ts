@@ -1,4 +1,4 @@
-// One path grammar for x-state and x-audience (RFD "Session state rules", section "Paths").
+// One path grammar for x-state and x-scope (RFD "Session state rules", section "Paths").
 //
 //   path    = "/" | ("/" segment)+
 //   segment = name | "{" field "}"         name = [A-Za-z0-9_]+    field = name ("." name)*

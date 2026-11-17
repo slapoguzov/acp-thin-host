@@ -15,7 +15,7 @@ type Node = { history: boolean; template: string | null; value: any };
 const copy = <T>(value: T): T => (value === undefined ? value : structuredClone(value));
 
 /**
- * What a receiver reads in the Agent's `capabilities.schema`: x-state and x-audience, nothing else. A custom message
+ * What a receiver reads in the Agent's `capabilities.schema`: x-state and x-scope, nothing else. A custom message
  * (its name starts with _) writes only a custom node, /sessions/{sessionId}/_name...; its other rows are ignored (RFD rule).
  */
 export function agentEntries(agentSchema: any): SchemaTable {
@@ -24,7 +24,7 @@ export function agentEntries(agentSchema: any): SchemaTable {
     const out: Entry = {};
     const rows = rowsOf(entry)?.filter(row => !name.startsWith('_') || customNode(row));
     if (rows?.length) out['x-state'] = rows;
-    if (Array.isArray(entry?.['x-audience']?.resource)) out['x-audience'] = entry['x-audience'];
+    if (Array.isArray(entry?.['x-scope'])) out['x-scope'] = entry['x-scope'];
     return Object.keys(out).length ? [[name, out]] : [];
   }));
   return { sessionUpdates: read(agentSchema?.sessionUpdates), methods: read(agentSchema?.methods) };

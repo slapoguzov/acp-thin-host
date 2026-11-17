@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { hostWith, tick } from './fixture.ts';
 
 const text = (t: string) => ({ type: 'text', text: t });
-const AUTH_STATUS = { methods: { '_auth/status_update': { 'x-audience': { resource: ['/'] } } } };
+const AUTH_STATUS = { methods: { '_auth/status_update': { 'x-scope': ['/'] } } };
 
 async function sharedSession(options = {}) {
   const env = hostWith(options);
@@ -48,7 +48,7 @@ test('B joins a live session: history comes from the host store, not from the Ag
   assert.equal(b.updates(sessionId).at(-1).messageId, 'm2', 'after joining, B gets live updates too');
 });
 
-test('permission request has binding "resource": both Clients see it, the first answer wins, the other is withdrawn', async () => {
+test('permission request: both Clients see it, the first answer wins, the other is withdrawn', async () => {
   const { agent, a, b, sessionId } = await twoClients();
 
   const reply = agent.ask('session/request_permission', { sessionId, toolCall: { toolCallId: 't1' }, options: [{ optionId: 'allow', kind: 'allow_once', name: 'Allow' }] });
@@ -91,11 +91,11 @@ test('Agent-level notification ("/"): every Client with the declaration, nobody 
     await tick();
     const expected = declared ? 1 : 0;
     assert.deepEqual([a.got('_auth/status_update').length, b.got('_auth/status_update').length], [expected, expected]);
-    if (!declared) assert.ok(logs.includes('dropped _auth/status_update: no audience'));
+    if (!declared) assert.ok(logs.includes('dropped _auth/status_update: no scope'));
   }
 });
 
-test('a request without an audience is refused with -32601', async () => {
+test('a request without a scope is refused with -32601', async () => {
   const { agent } = await sharedSession();
   const reply = await agent.ask('_fixture/pick', { sessionId: 's1' });
   assert.equal(reply.error.code, -32601);
@@ -111,20 +111,28 @@ test('closing a session that another Client still uses does not close it in the 
   assert.equal(a.updates(sessionId).length, 0);
 });
 
-test('a session request with binding "connection" goes to one Client: the one that sent the latest prompt', async () => {
-  const PICK = { methods: { '_fixture/pick': { 'x-audience': { resource: ['/sessions/{sessionId}'] } } } };
-  const { agent, a, b, sessionId } = await twoClients({ agentSchema: PICK });
+test('a session elicitation goes to every Client of the session, also the one that did not prompt; the first answer wins', async () => {
+  const { agent, client, a, b, sessionId } = await twoClients();
   void b.peer.request('session/prompt', { sessionId, prompt: [text('go')] });
   await tick();
   agent.endTurn(); // in v2 the prompt response only accepts the turn; the request comes later
   await tick();
-  b.answers.set('_fixture/pick', () => ({ picked: 'b' }));
-  const reply = await agent.ask('_fixture/pick', { sessionId });
-  assert.deepEqual(reply.result, { picked: 'b' });
-  assert.equal(a.got('_fixture/pick').length, 0);
+  const reply = agent.ask('elicitation/create', { sessionId, toolCallId: 't1', mode: 'form', message: 'Which file?', requestedSchema: { type: 'object', properties: {} } });
+  await tick();
+  assert.deepEqual([a.got('elicitation/create').length, b.got('elicitation/create').length], [1, 1], 'A did not send the prompt and still sees it');
+
+  const c = await client(); // joins while the elicitation waits
+  await c.call('session/resume', { sessionId, cwd: '/w', mcpServers: [] });
+  await tick();
+  assert.equal(c.got('elicitation/create').length, 1, 'a Client that joins later sees it too');
+
+  a.peer.send({ id: a.got('elicitation/create')[0].id, result: { action: 'accept', content: {} } });
+  assert.deepEqual((await reply).result, { action: 'accept', content: {} });
+  await tick();
+  assert.deepEqual([b.got('$/cancel_request').length, c.got('$/cancel_request').length], [1, 1], 'the others are withdrawn');
 });
 
-test('a request bound to the resource ends when every Client that holds it answered with an error, or left', async () => {
+test('a request ends when every Client that holds it answered with an error, or left', async () => {
   const { agent, a, b, sessionId } = await twoClients();
   const reply = agent.ask('session/request_permission', { sessionId, toolCall: { toolCallId: 't1' }, options: [] });
   await tick();
@@ -159,7 +167,7 @@ test('a permission request upserts the tool call it carries, and a joining Clien
 test('the host asks the Agent for its rows, uses them first, and gives its table only to Clients that ask', async () => {
   const newer = { // a newer Agent: a variant and a method that the host's schema lacks
     sessionUpdates: { review_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/reviews/{update.reviewId}' } } },
-    methods: { 'review/notice': { 'x-audience': { resource: ['/sessions/{sessionId}'] } } },
+    methods: { 'review/notice': { 'x-scope': ['/sessions/{sessionId}'] } },
   };
   const { agent, client, a, sessionId } = await sharedSession({ agentSchema: newer });
   assert.deepEqual(agent.calls.find(m => m.method === 'initialize')!.params.capabilities, { schema: {} }, 'the host asks upstream');
@@ -176,5 +184,5 @@ test('the host asks the Agent for its rows, uses them first, and gives its table
 
   agent.notify('review/notice', { sessionId, text: 'ready' });
   await tick();
-  assert.deepEqual([a.got('review/notice').length, b.got('review/notice').length], [1, 1], 'delivered by the Agent audience');
+  assert.deepEqual([a.got('review/notice').length, b.got('review/notice').length], [1, 1], 'delivered by the Agent scope');
 });

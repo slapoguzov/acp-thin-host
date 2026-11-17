@@ -2,7 +2,7 @@
   "name": "acp-thin-host",
   "private": true,
   "type": "module",
-  "description": "Thin ACP host: one Agent, several Clients, rules from x-state and x-audience schema data",
+  "description": "Thin ACP host: one Agent, several Clients, rules from x-state and x-scope schema data",
   "engines": { "node": ">=22.18" },
   "scripts": {
     "test": "node --test 'test/*.test.ts'",
