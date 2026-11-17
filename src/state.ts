@@ -84,7 +84,7 @@ export class SessionStore {
       for (const rule of rulesOf(entry)) {
         if (rule.action !== 'upsert' && rule.action !== 'replace') continue;
         const parts = rule.path!.split('/').slice(1);
-        if (shapeOf(parts) !== node.shape || parts.length !== node.shape.split('/').length) continue;
+        if (shapeOf(parts) !== node.shape) continue;
         const message = setIn({ update: {} }, (rule.value ?? 'update').split('.'), structuredClone(node.value));
         const ids = path.split('/').slice(1);
         parts.forEach((part, i) => {

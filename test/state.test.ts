@@ -75,10 +75,15 @@ test("the Agent's annotations: a custom update is stored; a custom rule cannot w
     sessionUpdates: {
       _task_update: { 'x-state': { action: 'upsert', path: '/sessions/{sessionId}/_tasks/{update.taskId}' } },
       _evil_update: { 'x-state': { action: 'replace', path: '/sessions/{sessionId}/config' } },
+      _other_update: { 'x-state': { action: 'upsert', path: '/sessions/{update.other}/_tasks/{update.taskId}' } },
+      _bad_update: { 'x-state': { action: 'merge' as any, path: '/sessions/{sessionId}/_x' } },
     },
   }));
   s.update({ sessionUpdate: '_task_update', taskId: 'k1', status: 'running' });
   s.update({ sessionUpdate: '_task_update', taskId: 'k1', status: 'done' });
   s.update({ sessionUpdate: '_evil_update', configOptions: [] });
+  s.update({ sessionUpdate: '_other_update', other: 's2', taskId: 'k2' });
+  s.update({ sessionUpdate: '_bad_update' });
+  assert.deepEqual(s.replay('s2'), { history: [], current: [] }, 'a custom rule writes only the session of its message');
   assert.deepEqual(s.replay('s1'), { history: [{ sessionUpdate: '_task_update', taskId: 'k1', status: 'done' }], current: [] });
 });

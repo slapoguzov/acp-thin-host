@@ -66,7 +66,7 @@ export class ThinHost {
 
     if (method === 'initialize') return this.initialize(params);
     if (method === 'session/resume' && holders.size > 0) return this.join(client, sessionId!, params);
-    if (method === 'session/close' && [...holders].some(other => other !== client)) { holders.delete(client); return { result: {} }; }
+    if (method === 'session/close' && [...holders].some(other => other !== client)) { this.leave(client, sessionId); return { result: {} }; }
     if (method === 'session/resume') {
       if (params.replayFrom) this.store.forget(sessionId!); // the Agent sends the whole history again
       holders.add(client); // the replay goes to this Client
@@ -103,10 +103,8 @@ export class ThinHost {
   private join(client: Peer, sessionId: string, params: any): Message {
     const { history, current } = this.store.replay(sessionId);
     const send = (update: any) => client.send({ method: 'session/update', params: { sessionId, update } });
-    if (params.replayFrom) history.forEach(send);
-    send({ sessionUpdate: 'replay_complete' });
-    current.filter(update => update.sessionUpdate !== 'state_update').forEach(send);
-    current.filter(update => update.sessionUpdate === 'state_update').forEach(send);
+    if (params.replayFrom) [...history, { sessionUpdate: 'replay_complete' }].forEach(send);
+    current.forEach(send);
     this.holders(sessionId).add(client);
     this.showPending(client, sessionId);
     this.log(`a Client joined ${sessionId}: ${params.replayFrom ? history.length : 0} history updates from the store`);
@@ -188,8 +186,17 @@ export class ThinHost {
 
   private disconnect(client: Peer) {
     this.clients.delete(client);
-    for (const holders of [...this.sessions.values(), ...this.elicitations.values()]) holders.delete(client);
+    for (const holders of this.elicitations.values()) holders.delete(client);
+    for (const [id, r] of this.requests) if (r.client === client) this.requests.delete(id);
+    this.leave(client);
+  }
+
+  /** The Client leaves one session, or all of them. It can no longer answer the requests it saw there. */
+  private leave(client: Peer, sessionId?: string) {
+    for (const [id, holders] of this.sessions) if (!sessionId || id === sessionId) holders.delete(client);
     for (const [agentId, request] of [...this.pending]) {
+      const scope = scopeOf(this.annotations, request.method, request.params);
+      if (sessionId && (scope?.kind !== 'sessions' || scope.id !== sessionId)) continue;
       if (!request.shownTo.delete(client)) continue;
       request.failed.delete(client);
       if (request.failed.size < request.shownTo.size) continue; // someone can still answer

@@ -96,3 +96,21 @@ test('a Client that asks with capabilities.schema gets the annotations the host 
   assert.equal(asks.initialized.capabilities.schema.sessionUpdates.tool_call_update['x-state'].action, 'upsert');
   assert.equal(plain.initialized.capabilities.schema, undefined);
 });
+
+test('a Client that closes the session or disconnects can no longer hold up a request', async () => {
+  const { agent, a, b } = await twoClients();
+  const reply = agent.ask('session/request_permission', permission);
+  await tick();
+  await b.call('session/close', { sessionId: 's1' });
+  const [shownToA] = a.got('session/request_permission');
+  a.peer.send({ id: shownToA.id, error: { code: -32603, message: 'dismissed' } });
+  assert.equal((await reply).error.message, 'dismissed', 'A was the last Client that could answer');
+
+  void a.peer.request('session/prompt', { sessionId: 's1', prompt: [text('go')] });
+  await tick();
+  const hostId = agent.calls.find(m => m.method === 'session/prompt')!.id;
+  (a.peer as any).output.end(); // A disconnects
+  await tick();
+  const elicitation = await agent.ask('elicitation/create', { requestId: hostId, mode: 'form', message: '?', requestedSchema: {} });
+  assert.ok(elicitation.error, 'nobody holds request ' + hostId);
+});

@@ -3,9 +3,9 @@
 A reference implementation for the RFD **v2 Session State and Message Scope Annotations** (`x-state`, `x-scope`).
 
 The host serves one ACP Agent to several Clients. A second Client can join a live session, and a request from the
-Agent reaches the right Client. The host has code only for the session lifecycle (`initialize`, `session/new`,
-`session/resume`, `session/close`). It has no code for any update variant or Agent-to-Client method: it reads
-what each message does from the annotations.
+Agent reaches the right Client. The host has code for the session lifecycle (`initialize`, `session/new`,
+`session/fork`, `session/resume`, `session/close`). How each update and each Agent-to-Client message is stored
+and where it goes comes from the annotations, so the host has no code for any of them.
 
 ```mermaid
 flowchart LR
@@ -25,14 +25,15 @@ Each update is stored by its rule from [`annotations.json`](annotations.json). T
 
 | The Agent sends | Rule | Stored |
 |---|---|---|
-| `agent_message_chunk` m1 `"Look"` | `append` `/sessions/{sessionId}/messages/agent/{update.messageId}/content` | message m1, content `["Look"]` |
-| `agent_message_chunk` m1 `"ing…"` | the same | message m1, content `["Look", "ing…"]` |
+| `agent_message_chunk` m1 `"Look"` | `append` `/sessions/{sessionId}/messages/agent/{update.messageId}/content` | message m1 with one content block |
+| `agent_message_chunk` m1 `"ing…"` | the same | message m1 with two content blocks |
 | `tool_call_update` t1 `in_progress` | `upsert` `/sessions/{sessionId}/toolCalls/{update.toolCallId}` | tool call t1, `in_progress` |
 | `notice` | `none` | nothing: live only |
 | `tool_call_update` t1 `completed` | the same `upsert` | tool call t1, `completed`, title kept |
 
-When Client B joins with `session/resume`, the host answers from its store. The Agent is not asked. Each entity
-is sent as one update, in the order of first report, and the current values follow:
+When Client B joins with `session/resume` and `replayFrom`, the host answers from its store. The Agent is not
+asked. Each entity is sent as one update, in the order of first report, then `replay_complete`, then the current
+values:
 
 ```
    host → B      session/update  user_message {"content":[{"type":"text","text":"Fix the test"}],"messageId":"u1"}
@@ -86,8 +87,10 @@ Agent declares its custom method:
 "capabilities": { "schema": { "methods": { "_auth/status_update": { "x-scope": ["/"] } } } }
 ```
 
-A custom rule may write only a `_` name, so a custom update cannot change ACP state. A Client that sets
-`capabilities.schema: {}` gets the annotations that the host uses.
+A custom update or method may write only a `_` name below `/sessions/{sessionId}/` or directly below `/`, so it
+cannot change ACP state. The Agent may also send annotations for ACP messages; the RFD requires them to be the
+ones of its schema, and the host uses them as they come. A Client that sets `capabilities.schema: {}` gets the
+annotations that the host uses.
 
 ## Files
 
@@ -97,11 +100,11 @@ A custom rule may write only a `_` name, so a custom update cannot change ACP st
 | [`src/state.ts`](src/state.ts) | 153 | `x-state`: one generic function that stores each session, and the replay for a joining Client |
 | [`src/scope.ts`](src/scope.ts) | 24 | `x-scope`: what an Agent-to-Client message is about |
 | [`src/paths.ts`](src/paths.ts) | 24 | The path grammar of both annotations |
-| [`src/annotations.ts`](src/annotations.ts) | 36 | Loads the table and puts the Agent's annotations over it |
-| [`src/host.ts`](src/host.ts) | 200 | The host: the session lifecycle and delivery by scope |
+| [`src/annotations.ts`](src/annotations.ts) | 39 | Loads the table and puts the Agent's annotations over it |
+| [`src/host.ts`](src/host.ts) | 207 | The host: the session lifecycle and delivery by scope |
 | [`src/jsonrpc.ts`](src/jsonrpc.ts), [`src/main.ts`](src/main.ts), [`src/watch.ts`](src/watch.ts) | 139 | JSON-RPC over streams, the command line, and a terminal Client |
 | [`check.ts`](check.ts) | 75 | The generator rule of the RFD, run on the ACP schema |
-| [`demo.ts`](demo.ts), [`test/`](test) | 334 | The walk-through and 14 tests on a scripted Agent |
+| [`demo.ts`](demo.ts), [`test/`](test) | 357 | The walk-through and 15 tests on a scripted Agent |
 
 ## Check the annotations against ACP
 
@@ -131,7 +134,10 @@ annotations in `initialize` solve.
 The RFD defines data, not host behavior. These choices belong to this host only:
 
 - One user is behind all Clients. Every Client that holds a scope sees a request, and the first answer wins.
-- An update variant without a rule is sent live and is not stored.
+- An update variant without a rule is sent live and is not stored. So is a custom path directly below `/`, and
+  an entity that no variant can send whole (only an `append` rule writes it).
+- A message scoped to a custom path directly below `/` goes to every Client, like `/`.
+- Two Clients that resume one session at the same moment can both get the history from the Agent.
 - MCP over ACP (`/mcpServers`) is not supported.
 - The first Client's `initialize` goes to the Agent, and every Client gets its result.
 
